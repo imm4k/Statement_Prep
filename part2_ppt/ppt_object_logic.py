@@ -417,9 +417,290 @@ def _update_summary_table(slide: Slide, shape: BaseShape, prs: Presentation, ctx
     print(f"summary_table cumulative_income updated rows: {income_hits}")
     print(f"summary_table cumulative_return updated rows: {return_hits}")
 
+def _update_monthly_perf_table(slide: Slide, shape: BaseShape, prs: Presentation, ctx: UpdateContext) -> None:
+    if not hasattr(shape, "table"):
+        return
+
+    from pptx.dml.color import RGBColor
+    from pptx.util import Pt
+    from datetime import date
+
+    def _norm_header(s: str) -> str:
+        return s.replace("\r", "").replace(" \n", "\n").strip()
+
+    def _fmt_currency(x: float) -> tuple[str, bool]:
+        # Matches Excel custom format: $#,##0;[Red]($#,##0);-
+        if abs(x) < 0.5:
+            return "-", False
+        if x < 0:
+            return f"(${abs(x):,.0f})", True
+        return f"${x:,.0f}", False
+
+    def _apply_red_if_negative(cell, is_negative: bool) -> None:
+        if not is_negative:
+            return
+        try:
+            p0 = cell.text_frame.paragraphs[0]
+            if p0.runs:
+                p0.runs[0].font.color.rgb = RGBColor(255, 0, 0)
+        except Exception:
+            return
+
+    def _set_currency_cell(cell, amount: float) -> None:
+        txt, is_neg = _fmt_currency(amount)
+        _set_cell_text_preserve_cell_format(cell, txt)
+        _apply_red_if_negative(cell, is_neg)
+
+    def _month_year_label(dt: date) -> str:
+        # Example: "Mar 2024"
+        return dt.strftime("%b %Y")
+
+    def _add_months(dt: date, months: int) -> date:
+        y = dt.year + (dt.month - 1 + months) // 12
+        m = (dt.month - 1 + months) % 12 + 1
+        return date(y, m, 1)
+
+    tbl = shape.table
+
+    # Column headers on row index 1 (PowerPoint row 2)
+    col_month_year = None
+    col_rent = None
+    col_other_rev = None
+    col_total_rev = None
+    col_mortgage = None
+    col_hoa = None
+    col_mgt_fee = None
+    col_repairs = None
+    col_other_exp = None
+    col_total_exp = None
+    col_monthly = None
+    col_cumulative = None
+
+    for c in range(len(tbl.columns)):
+        header = _norm_header(tbl.cell(1, c).text)
+        if header == "Month Year":
+            col_month_year = c
+        elif header == "Rent":
+            col_rent = c
+        elif header == "Other Revenue":
+            col_other_rev = c
+        elif header == "Total Revenue":
+            col_total_rev = c
+        elif header == "Mortgage":
+            col_mortgage = c
+        elif header == "HOA":
+            col_hoa = c
+        elif header == "Mgt. Fee":
+            col_mgt_fee = c
+        elif header == "Repairs Exp.":
+            col_repairs = c
+        elif header == "Other Expense":
+            col_other_exp = c
+        elif header == "Total Expenses":
+            col_total_exp = c
+        elif header == "Monthly":
+            col_monthly = c
+        elif header == "Cumulative":
+            col_cumulative = c
+
+    if col_month_year is None:
+        print("monthly_perf_table missing required column header: Month Year")
+        return
+
+    # Build token map: [T13] is statement thru month, [T12] is prior month, ... [T1] is 12 months prior
+    stmt_month_start = date(ctx.statement_thru_date_dt.year, ctx.statement_thru_date_dt.month, 1)
+
+    token_to_month_start: Dict[str, date] = {}
+    for n in range(1, 14):
+        months_back = 13 - n  # T13 -> 0 back, T1 -> 12 back
+        token_to_month_start[f"[T{n}]"] = _add_months(stmt_month_start, -months_back)
+
+    token_to_label: Dict[str, str] = {k: _month_year_label(v) for k, v in token_to_month_start.items()}
+
+    # Pull all needed monthly values in one query (excluding timeframe = 'N/A')
+    wanted_cats = (
+        "Rent",
+        "Other Revenue",
+        "Mortgage",
+        "HOA",
+        "Mgt. Fee",
+        "Repairs Exp.",
+        "Other Expense",
+    )
+
+    placeholders = ",".join(["?"] * len(wanted_cats))
+    sql = f"""
+        SELECT timeframe, categorization, gl_mapping_type, SUM(value) AS total_value
+        FROM gl_agg
+        WHERE investor = ?
+          AND (timeframe IS NULL OR timeframe <> 'N/A')
+          AND timeframe IN ('[T1]','[T2]','[T3]','[T4]','[T5]','[T6]','[T7]','[T8]','[T9]','[T10]','[T11]','[T12]','[T13]')
+          AND categorization IN ({placeholders})
+        GROUP BY timeframe, categorization, gl_mapping_type
+    """
+
+    con = sqlite3.connect(str(config.SQLITE_PATH))
+    rows = con.execute(sql, (ctx.investor, *wanted_cats)).fetchall()
+    con.close()
+
+    # Build dict: timeframe -> categorization -> adjusted_value
+    # Adjustment: for Revenue and Expense mapping types, flip sign (debit-credit convention)
+    vals: Dict[str, Dict[str, float]] = {}
+    for tf, cat, mapping_type, total_value in rows:
+        tf_key = str(tf).strip()
+        cat_key = str(cat).strip()
+        mt = str(mapping_type or "").strip().lower()
+        v = float(total_value or 0.0)
+
+        if mt in ("revenue", "expense"):
+            v = -1.0 * v
+
+        if tf_key not in vals:
+            vals[tf_key] = {}
+        vals[tf_key][cat_key] = vals[tf_key].get(cat_key, 0.0) + v
+
+    total_row_idx = len(tbl.rows) - 1
+
+    cumulative_running = 0.0
+
+    # For totals row calculations
+    total_rent = 0.0
+    total_other_rev = 0.0
+    total_mortgage = 0.0
+    total_hoa = 0.0
+    total_mgt_fee = 0.0
+    total_repairs = 0.0
+    total_other_exp = 0.0
+    total_monthly = 0.0
+
+    data_row_count = max(0, len(tbl.rows) - 3)
+    print(f"monthly_perf_table Starting process for {data_row_count} rows.")
+
+    current = 0
+    for r in range(2, len(tbl.rows)):
+        if r == total_row_idx:
+            continue
+
+        row_label = tbl.cell(r, col_month_year).text.strip()
+        if row_label == "":
+            continue
+
+        # Identify timeframe token present in the row label
+        tf_token = None
+        for token in token_to_label.keys():
+            if token in row_label:
+                tf_token = token
+                break
+
+        if tf_token is None:
+            continue
+
+        current += 1
+        print(f"monthly_perf_table Currently on {current} of {data_row_count}")
+
+        # Replace the token in the Month Year label cell
+        new_label = row_label.replace(tf_token, token_to_label[tf_token])
+        _set_cell_text_preserve_cell_format(tbl.cell(r, col_month_year), new_label)
+        p = tbl.cell(r, col_month_year).text_frame.paragraphs[0]
+        if p.runs:
+            r0 = p.runs[0]
+            r0.font.name = "Lato"
+            r0.font.size = Pt(10)
+            r0.font.color.rgb = RGBColor(0, 0, 0)
+
+        tf_key = tf_token  # matches gl_agg timeframe strings like "[T13]"
+        tf_vals = vals.get(tf_key, {})
+
+        rent = float(tf_vals.get("Rent", 0.0))
+        other_rev = float(tf_vals.get("Other Revenue", 0.0))
+
+        mortgage = float(tf_vals.get("Mortgage", 0.0))
+        hoa = float(tf_vals.get("HOA", 0.0))
+        mgt_fee = float(tf_vals.get("Mgt. Fee", 0.0))
+        repairs = float(tf_vals.get("Repairs Exp.", 0.0))
+        other_exp = float(tf_vals.get("Other Expense", 0.0))
+
+        total_rev = rent + other_rev
+        total_exp = mortgage + hoa + mgt_fee + repairs + other_exp
+        monthly = total_rev + total_exp
+
+        # Cumulative is rolling down the table
+        if cumulative_running == 0.0:
+            cumulative_running = monthly
+        else:
+            cumulative_running = cumulative_running + monthly
+
+        # Write base columns
+        if col_rent is not None:
+            _set_currency_cell(tbl.cell(r, col_rent), rent)
+        if col_other_rev is not None:
+            _set_currency_cell(tbl.cell(r, col_other_rev), other_rev)
+        if col_total_rev is not None:
+            _set_currency_cell(tbl.cell(r, col_total_rev), total_rev)
+
+        if col_mortgage is not None:
+            _set_currency_cell(tbl.cell(r, col_mortgage), mortgage)
+        if col_hoa is not None:
+            _set_currency_cell(tbl.cell(r, col_hoa), hoa)
+        if col_mgt_fee is not None:
+            _set_currency_cell(tbl.cell(r, col_mgt_fee), mgt_fee)
+        if col_repairs is not None:
+            _set_currency_cell(tbl.cell(r, col_repairs), repairs)
+        if col_other_exp is not None:
+            _set_currency_cell(tbl.cell(r, col_other_exp), other_exp)
+        if col_total_exp is not None:
+            _set_currency_cell(tbl.cell(r, col_total_exp), total_exp)
+
+        if col_monthly is not None:
+            _set_currency_cell(tbl.cell(r, col_monthly), monthly)
+        if col_cumulative is not None:
+            _set_currency_cell(tbl.cell(r, col_cumulative), cumulative_running)
+
+        # Accumulate for totals row
+        total_rent += rent
+        total_other_rev += other_rev
+        total_mortgage += mortgage
+        total_hoa += hoa
+        total_mgt_fee += mgt_fee
+        total_repairs += repairs
+        total_other_exp += other_exp
+        total_monthly += monthly
+
+    # Total row is last row: sum of everything (excluding timeframe = 'N/A' already handled in query)
+    total_rev_all = total_rent + total_other_rev
+    total_exp_all = total_mortgage + total_hoa + total_mgt_fee + total_repairs + total_other_exp
+    total_monthly_all = total_rev_all + total_exp_all
+
+    if col_rent is not None:
+        _set_currency_cell(tbl.cell(total_row_idx, col_rent), total_rent)
+    if col_other_rev is not None:
+        _set_currency_cell(tbl.cell(total_row_idx, col_other_rev), total_other_rev)
+    if col_total_rev is not None:
+        _set_currency_cell(tbl.cell(total_row_idx, col_total_rev), total_rev_all)
+
+    if col_mortgage is not None:
+        _set_currency_cell(tbl.cell(total_row_idx, col_mortgage), total_mortgage)
+    if col_hoa is not None:
+        _set_currency_cell(tbl.cell(total_row_idx, col_hoa), total_hoa)
+    if col_mgt_fee is not None:
+        _set_currency_cell(tbl.cell(total_row_idx, col_mgt_fee), total_mgt_fee)
+    if col_repairs is not None:
+        _set_currency_cell(tbl.cell(total_row_idx, col_repairs), total_repairs)
+    if col_other_exp is not None:
+        _set_currency_cell(tbl.cell(total_row_idx, col_other_exp), total_other_exp)
+    if col_total_exp is not None:
+        _set_currency_cell(tbl.cell(total_row_idx, col_total_exp), total_exp_all)
+
+    if col_monthly is not None:
+        _set_currency_cell(tbl.cell(total_row_idx, col_monthly), total_monthly_all)
+    if col_cumulative is not None:
+        _set_currency_cell(tbl.cell(total_row_idx, col_cumulative), total_monthly_all)
+
+    print("monthly_perf_table updated.")
 
 OBJECT_UPDATERS: Dict[str, ObjectUpdater] = {
     "cover_title": _update_cover_title,
     "cover_subtitle": _update_cover_subtitle,
     "summary_table": _update_summary_table,
+    "monthly_perf_table": _update_monthly_perf_table,
 }
