@@ -65,6 +65,8 @@ def run_part1() -> None:
         db_path=SQLITE_PATH,
         gl_raw_table=GL_RAW_TABLE,
         gl_agg_table=GL_AGG_TABLE,
+        investor_table_df=setup.investor_table,
+        statement_thru_date=setup.general.statement_thru_date,
     )
     print("Completed aggregation build.")
 

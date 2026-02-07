@@ -63,7 +63,6 @@ def ensure_schema(conn, gl_raw_table: str) -> None:
     )
     conn.commit()
 
-
 def reset_raw_table(conn, gl_raw_table: str) -> None:
     conn.execute(f"DROP TABLE IF EXISTS {gl_raw_table};")
     ensure_schema(conn, gl_raw_table)

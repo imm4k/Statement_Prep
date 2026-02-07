@@ -13,13 +13,16 @@ def ensure_agg_schema(conn, gl_agg_table: str) -> None:
             investor TEXT,
             owner TEXT,
             property_name TEXT,
+            acquired TEXT,
             categorization TEXT,
-            value REAL
+            gl_mapping_type TEXT,
+            value REAL,
+            property TEXT,
+            timeframe TEXT
         );
         """
     )
     conn.commit()
-
 
 def reset_agg_table(conn, gl_agg_table: str) -> None:
     conn.execute(f"DROP TABLE IF EXISTS {gl_agg_table};")
@@ -147,6 +150,8 @@ def build_aggregate_table(
     db_path: str,
     gl_raw_table: str,
     gl_agg_table: str,
+    investor_table_df: pd.DataFrame,
+    statement_thru_date: str,
 ) -> None:
     conn = connect(db_path)
     try:
@@ -154,13 +159,15 @@ def build_aggregate_table(
 
         conn.execute(
             f"""
-            INSERT INTO {gl_agg_table} (month_start, investor, owner, property_name, categorization, value)
+            INSERT INTO {gl_agg_table} (month_start, investor, owner, property_name, acquired, categorization, gl_mapping_type, value)
             SELECT
                 month_start,
                 investor,
                 owner,
                 property_name,
+                MIN(acquired) AS acquired,
                 categorization,
+                gl_mapping_type,
                 COALESCE(SUM(debit), 0.0) - COALESCE(SUM(credit), 0.0) AS value
             FROM {gl_raw_table}
             GROUP BY
@@ -168,15 +175,78 @@ def build_aggregate_table(
                 investor,
                 owner,
                 property_name,
-                categorization
+                categorization,
+                gl_mapping_type
             ORDER BY
                 month_start ASC,
                 investor ASC,
                 owner ASC,
                 property_name ASC,
-                categorization ASC;
+                categorization ASC,
+                gl_mapping_type ASC;
             """
         )
+
+        # Append property from Investor Table (Property Name -> Property)
+        conn.execute("DROP TABLE IF EXISTS _prop_map;")
+        conn.execute(
+            """
+            CREATE TABLE _prop_map (
+                property_name TEXT,
+                property TEXT
+            );
+            """
+        )
+
+        prop_rows = []
+        for row in investor_table_df[["Property Name", "Property"]].itertuples(index=False, name=None):
+            property_name, prop = row
+            prop_rows.append((str(property_name).strip(), str(prop).strip() if str(prop).strip() else None))
+
+        conn.executemany(
+            "INSERT INTO _prop_map (property_name, property) VALUES (?, ?);",
+            prop_rows,
+        )
+
+        conn.execute(
+            f"""
+            UPDATE {gl_agg_table}
+            SET property = (
+                SELECT p.property
+                FROM _prop_map p
+                WHERE p.property_name = {gl_agg_table}.property_name
+                LIMIT 1
+            );
+            """
+        )
+        conn.execute("DROP TABLE IF EXISTS _prop_map;")
+
+        # Append timeframe [T1]..[T13] based on Statement Thru Date month
+        t1_start = pd.to_datetime(statement_thru_date, errors="raise").to_period("M").to_timestamp().strftime("%Y-%m-%d")
+
+        conn.execute(
+            f"""
+            UPDATE {gl_agg_table}
+            SET timeframe = (
+                CASE
+                    WHEN (
+                        (CAST(strftime('%Y', ?) AS INTEGER) * 12 + CAST(strftime('%m', ?) AS INTEGER))
+                        - (CAST(strftime('%Y', month_start) AS INTEGER) * 12 + CAST(strftime('%m', month_start) AS INTEGER))
+                    ) BETWEEN 0 AND 11
+                    THEN '[T' || (
+                        (
+                            (CAST(strftime('%Y', ?) AS INTEGER) * 12 + CAST(strftime('%m', ?) AS INTEGER))
+                            - (CAST(strftime('%Y', month_start) AS INTEGER) * 12 + CAST(strftime('%m', month_start) AS INTEGER))
+                        ) + 1
+                    ) || ']'
+                    ELSE '[T13]'
+                END
+            );
+            """,
+            (t1_start, t1_start, t1_start, t1_start),
+        )
+
         conn.commit()
+
     finally:
         conn.close()
