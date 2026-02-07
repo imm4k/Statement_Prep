@@ -229,6 +229,14 @@ def build_aggregate_table(
             UPDATE {gl_agg_table}
             SET timeframe = (
                 CASE
+                    -- Future months
+                    WHEN (
+                        (CAST(strftime('%Y', month_start) AS INTEGER) * 12 + CAST(strftime('%m', month_start) AS INTEGER))
+                        > (CAST(strftime('%Y', ?) AS INTEGER) * 12 + CAST(strftime('%m', ?) AS INTEGER))
+                    )
+                    THEN 'N/A'
+
+                    -- T1 to T12
                     WHEN (
                         (CAST(strftime('%Y', ?) AS INTEGER) * 12 + CAST(strftime('%m', ?) AS INTEGER))
                         - (CAST(strftime('%Y', month_start) AS INTEGER) * 12 + CAST(strftime('%m', month_start) AS INTEGER))
@@ -239,11 +247,13 @@ def build_aggregate_table(
                             - (CAST(strftime('%Y', month_start) AS INTEGER) * 12 + CAST(strftime('%m', month_start) AS INTEGER))
                         ) + 1
                     ) || ']'
+
+                    -- Older than T12
                     ELSE '[T13]'
                 END
             );
             """,
-            (t1_start, t1_start, t1_start, t1_start),
+            (t1_start, t1_start, t1_start, t1_start, t1_start, t1_start),
         )
 
         conn.commit()
