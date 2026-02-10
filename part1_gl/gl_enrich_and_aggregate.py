@@ -13,11 +13,14 @@ def ensure_agg_schema(conn, gl_agg_table: str) -> None:
             investor TEXT,
             owner TEXT,
             property_name TEXT,
+            property TEXT,
             acquired TEXT,
             categorization TEXT,
             gl_mapping_type TEXT,
             value REAL,
-            property TEXT,
+            cash_categorization TEXT,
+            cash_value REAL,
+            cash_type_mapping TEXT,
             timeframe TEXT
         );
         """
@@ -57,7 +60,9 @@ def apply_mappings_inplace(
             CREATE TABLE _gl_map (
                 gl_account TEXT,
                 categorization TEXT,
-                gl_mapping_type TEXT
+                gl_mapping_type TEXT,
+                cash_categorization TEXT,
+                cash_type_mapping TEXT
             );
             """
         )
@@ -77,12 +82,14 @@ def apply_mappings_inplace(
 
         gl_rows = []
         for row in gl_mapping_df.itertuples(index=False, name=None):
-            gl_account, categorization, gl_mapping_type = row
+            gl_account, categorization, gl_mapping_type, cash_categorization, cash_type_mapping = row
             gl_rows.append(
                 (
                     str(gl_account).strip(),
                     str(categorization).strip() if str(categorization).strip() else None,
                     str(gl_mapping_type).strip() if str(gl_mapping_type).strip() else None,
+                    str(cash_categorization).strip() if str(cash_categorization).strip() else None,
+                    str(cash_type_mapping).strip() if str(cash_type_mapping).strip() else None,
                 )
             )
 
@@ -92,7 +99,7 @@ def apply_mappings_inplace(
         )
 
         conn.executemany(
-            "INSERT INTO _gl_map (gl_account, categorization, gl_mapping_type) VALUES (?, ?, ?);",
+            "INSERT INTO _gl_map (gl_account, categorization, gl_mapping_type, cash_categorization, cash_type_mapping) VALUES (?, ?, ?, ?, ?);",
             gl_rows,
         )
 
@@ -135,6 +142,18 @@ def apply_mappings_inplace(
                     FROM _gl_map g
                     WHERE g.gl_account = {gl_raw_table}.gl_account
                     LIMIT 1
+                ),
+                cash_categorization = (
+                    SELECT g.cash_categorization
+                    FROM _gl_map g
+                    WHERE g.gl_account = {gl_raw_table}.gl_account
+                    LIMIT 1
+                ),
+                cash_type_mapping = (
+                    SELECT g.cash_type_mapping
+                    FROM _gl_map g
+                    WHERE g.gl_account = {gl_raw_table}.gl_account
+                    LIMIT 1
                 );
             """
         )
@@ -159,7 +178,11 @@ def build_aggregate_table(
 
         conn.execute(
             f"""
-            INSERT INTO {gl_agg_table} (month_start, investor, owner, property_name, acquired, categorization, gl_mapping_type, value)
+            INSERT INTO {gl_agg_table} (
+                month_start, investor, owner, property_name, acquired,
+                categorization, gl_mapping_type, value,
+                cash_categorization, cash_value, cash_type_mapping
+            )
             SELECT
                 month_start,
                 investor,
@@ -168,22 +191,53 @@ def build_aggregate_table(
                 MIN(acquired) AS acquired,
                 categorization,
                 gl_mapping_type,
-                COALESCE(SUM(debit), 0.0) - COALESCE(SUM(credit), 0.0) AS value
+                COALESCE(SUM(debit), 0.0) - COALESCE(SUM(credit), 0.0) AS value,
+                cash_categorization,
+                COALESCE(SUM(debit), 0.0) - COALESCE(SUM(credit), 0.0) AS cash_value,
+                MIN(cash_type_mapping) AS cash_type_mapping
             FROM {gl_raw_table}
+            WHERE COALESCE(cash_categorization, '') <> 'Mortgage'
             GROUP BY
+                month_start, investor, owner, property_name, categorization, gl_mapping_type, cash_categorization
+
+            UNION ALL
+
+            SELECT
                 month_start,
                 investor,
                 owner,
                 property_name,
+                MIN(acquired) AS acquired,
                 categorization,
-                gl_mapping_type
-            ORDER BY
-                month_start ASC,
-                investor ASC,
-                owner ASC,
-                property_name ASC,
-                categorization ASC,
-                gl_mapping_type ASC;
+                gl_mapping_type,
+                COALESCE(SUM(debit), 0.0) AS value,
+                'Mortgage Payment' AS cash_categorization,
+                COALESCE(SUM(debit), 0.0) AS cash_value,
+                'Outflow' AS cash_type_mapping
+            FROM {gl_raw_table}
+            WHERE cash_categorization = 'Mortgage'
+            GROUP BY
+                month_start, investor, owner, property_name, categorization, gl_mapping_type
+
+            UNION ALL
+
+            SELECT
+                month_start,
+                investor,
+                owner,
+                property_name,
+                MIN(acquired) AS acquired,
+                categorization,
+                gl_mapping_type,
+                0.0 - COALESCE(SUM(credit), 0.0) AS value,
+                'Mortgage Loan' AS cash_categorization,
+                COALESCE(SUM(credit), 0.0) AS cash_value,
+                'Inflow' AS cash_type_mapping
+            FROM {gl_raw_table}
+            WHERE cash_categorization = 'Mortgage'
+            GROUP BY
+                month_start, investor, owner, property_name, categorization, gl_mapping_type
+            ;
             """
         )
 

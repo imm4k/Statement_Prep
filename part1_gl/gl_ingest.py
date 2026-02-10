@@ -57,7 +57,9 @@ def ensure_schema(conn, gl_raw_table: str) -> None:
             acquired TEXT,
             investor_type TEXT,
             categorization TEXT,
-            gl_mapping_type TEXT
+            gl_mapping_type TEXT,
+            cash_categorization TEXT,
+            cash_type_mapping TEXT
         );
         """
     )
@@ -115,6 +117,8 @@ def ingest_gl_csv_to_raw(
     df["investor_type"] = None
     df["categorization"] = None
     df["gl_mapping_type"] = None
+    df["cash_categorization"] = None
+    df["cash_type_mapping"] = None
 
     insert_cols = [
         "month_start",
@@ -133,6 +137,8 @@ def ingest_gl_csv_to_raw(
         "investor_type",
         "categorization",
         "gl_mapping_type",
+        "cash_categorization",
+        "cash_type_mapping",
     ]
 
     rows = [tuple(x) for x in df[insert_cols].itertuples(index=False, name=None)]
@@ -146,12 +152,12 @@ def ingest_gl_csv_to_raw(
             month_start, txn_date, gl_account, gl_type, property_name,
             property_street_address_1, property_street_address_2,
             debit, credit, balance,
-            investor, owner, acquired, investor_type, categorization, gl_mapping_type
+            investor, owner, acquired, investor_type, categorization, gl_mapping_type, cash_categorization, cash_type_mapping
         ) VALUES (
             ?, ?, ?, ?, ?,
             ?, ?,
             ?, ?, ?,
-            ?, ?, ?, ?, ?, ?
+            ?, ?, ?, ?, ?, ?, ?, ?
         );
         """
 

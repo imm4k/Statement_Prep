@@ -128,7 +128,7 @@ def _read_gl_mapping(xlsx_path: str) -> pd.DataFrame:
         engine="openpyxl",
     )
 
-    required = ["GL Account", "Categorization", "GL Type"]
+    required = ["GL Account", "Categorization", "GL Type", "Cash Categorization", "Cash Type"]
     missing = [c for c in required if c not in df.columns]
     if missing:
         raise ValueError(f"GL Mapping missing required columns: {missing}")
@@ -137,6 +137,8 @@ def _read_gl_mapping(xlsx_path: str) -> pd.DataFrame:
     df["GL Account"] = df["GL Account"].astype(str).str.strip()
     df["Categorization"] = df["Categorization"].astype(str).str.strip()
     df["GL Type"] = df["GL Type"].astype(str).str.strip()
+    df["Cash Categorization"] = df["Cash Categorization"].astype(str).str.strip()
+    df["Cash Type"] = df["Cash Type"].astype(str).str.strip()
 
     return df
 
