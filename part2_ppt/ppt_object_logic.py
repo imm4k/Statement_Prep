@@ -8,12 +8,15 @@ from ppt_object_logic_text import (
     update_cover_title,
     update_cover_subtitle,
     update_summary_title,
+    update_cash_summary_title,
     update_summary_top_text,
 )
 
 from ppt_object_logic_tables import (
     update_summary_table,
     update_monthly_perf_table,
+    update_monthly_cash_table,
+    update_available_cash,
 )
 
 OBJECT_UPDATERS: Dict[str, ObjectUpdater] = {
@@ -22,5 +25,8 @@ OBJECT_UPDATERS: Dict[str, ObjectUpdater] = {
     "summary_title": update_summary_title,
     "summary_table": update_summary_table,
     "summary_top_text": update_summary_top_text,
-#    "monthly_perf_table": update_monthly_perf_table,
+    "cash_summary_title": update_cash_summary_title,
+    "available_cash": update_available_cash,
+    "monthly_cash_table": update_monthly_cash_table,
+    "monthly_perf_table": update_monthly_perf_table,
 }

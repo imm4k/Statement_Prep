@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import sqlite3
 from datetime import datetime
-from typing import Dict
+from typing import Dict, Tuple
 
 import config
 
@@ -464,7 +464,7 @@ def update_monthly_perf_table(slide: Slide, shape: BaseShape, prs: Presentation,
             col_other_rev = c
         elif header == "Total Revenue":
             col_total_rev = c
-        elif header == "Mortgage":
+        elif header in "Mortgage Interest":
             col_mortgage = c
         elif header == "HOA":
             col_hoa = c
@@ -691,3 +691,450 @@ def update_monthly_perf_table(slide: Slide, shape: BaseShape, prs: Presentation,
         _set_currency_cell(tbl.cell(total_row_idx, col_cumulative), total_monthly_all)
 
     print("monthly_perf_table updated.")
+
+def update_monthly_cash_table(slide: Slide, shape: BaseShape, prs: Presentation, ctx: UpdateContext) -> None:
+    if not hasattr(shape, "table"):
+        return
+
+    from pptx.dml.color import RGBColor
+    from pptx.util import Pt
+    from datetime import date
+
+    def _norm_header(s: str) -> str:
+        return s.replace("\r", "").replace(" \n", "\n").strip()
+
+    def _fmt_currency(x: float) -> tuple[str, bool]:
+        if abs(x) < 0.5:
+            return "-", False
+        if x < 0:
+            return f"(${abs(x):,.0f})", True
+        return f"${x:,.0f}", False
+
+    def _apply_red_if_negative(cell, is_negative: bool) -> None:
+        if not is_negative:
+            return
+        try:
+            p0 = cell.text_frame.paragraphs[0]
+            if p0.runs:
+                p0.runs[0].font.color.rgb = RGBColor(255, 0, 0)
+        except Exception:
+            return
+
+    def _set_currency_cell(cell, amount: float) -> None:
+        txt, is_neg = _fmt_currency(amount)
+        _set_cell_text_preserve_cell_format(cell, txt)
+        _apply_red_if_negative(cell, is_neg)
+
+    def _month_year_label(dt: date) -> str:
+        return dt.strftime("%b %Y")
+
+    tbl = shape.table
+
+    col_month_year = None
+    col_owner_contrib = None
+    col_mortgage_loan = None
+    col_rent_dividend = None
+    col_total_inflow = None
+    col_apartment_improve = None
+    col_mortgage_payment = None
+    col_hoa = None
+    col_mgt_fee = None
+    col_repairs_other = None
+    col_owner_distribution = None
+    col_total_outflow = None
+    col_monthly = None
+    col_cumulative = None
+
+    for c in range(len(tbl.columns)):
+        header = _norm_header(tbl.cell(1, c).text)
+
+        if header == "Month Year":
+            col_month_year = c
+        elif header == "Owner Contribution":
+            col_owner_contrib = c
+        elif header == "Mortgage\nLoan":
+            col_mortgage_loan = c
+        elif header == "Rent & Dividend":
+            col_rent_dividend = c
+        elif header in ("Total\nInflow", "Total Inflow"):
+            col_total_inflow = c
+        elif header == "Apartment & Improve.":
+            col_apartment_improve = c
+        elif header == "Mortgage Payment":
+            col_mortgage_payment = c
+        elif header == "HOA":
+            col_hoa = c
+        elif header == "Mgt. Fee":
+            col_mgt_fee = c
+        elif header == "Repairs & Other Expense":
+            col_repairs_other = c
+        elif header == "Owner Distribution":
+            col_owner_distribution = c
+        elif header in ("Total\nOutflow", "Total Outflow"):
+            col_total_outflow = c
+        elif header == "Monthly":
+            col_monthly = c
+        elif header == "Cumulative":
+            col_cumulative = c
+        elif header == "Monthly\nCumulative":
+            # Fallback in case the header text is copied as a combined string.
+            # Assume Monthly is this column and Cumulative is the next column.
+            col_monthly = c
+            if c + 1 < len(tbl.columns):
+                col_cumulative = c + 1
+
+    if col_month_year is None:
+        print("monthly_cash_table missing required column header: Month Year")
+        return
+
+    timeframes = [f"[T{n}]" for n in range(1, 14)]
+    tf_list_sql = ",".join([f"'{tf}'" for tf in timeframes])
+
+    sql_tf_months = f"""
+        SELECT timeframe, MAX(month_start) AS month_start
+        FROM gl_agg
+        WHERE investor = ?
+          AND timeframe IS NOT NULL
+          AND timeframe <> 'N/A'
+          AND timeframe IN ({tf_list_sql})
+          AND month_start IS NOT NULL
+        GROUP BY timeframe
+    """
+
+    con = sqlite3.connect(str(config.SQLITE_PATH))
+    tf_rows = con.execute(sql_tf_months, (ctx.investor,)).fetchall()
+    con.close()
+
+    token_to_month_start: Dict[str, date] = {}
+    for tf, ms in tf_rows:
+        try:
+            y = int(str(ms)[:4])
+            m = int(str(ms)[5:7])
+            token_to_month_start[str(tf).strip()] = date(y, m, 1)
+        except Exception:
+            continue
+
+    token_to_label: Dict[str, str] = {}
+    for tf in timeframes:
+        dt = token_to_month_start.get(tf)
+        if dt is None:
+            continue
+        token_to_label[tf] = _month_year_label(dt)
+
+    sql = f"""
+        SELECT timeframe,
+               cash_categorization,
+               cash_type_mapping,
+               SUM(cash_value) AS total_value
+        FROM gl_agg
+        WHERE investor = ?
+          AND (timeframe IS NULL OR timeframe <> 'N/A')
+          AND timeframe IN ('[T1]','[T2]','[T3]','[T4]','[T5]','[T6]','[T7]','[T8]','[T9]','[T10]','[T11]','[T12]','[T13]')
+        GROUP BY timeframe, cash_categorization, cash_type_mapping
+    """
+
+    con = sqlite3.connect(str(config.SQLITE_PATH))
+    rows = con.execute(sql, (ctx.investor,)).fetchall()
+    con.close()
+
+    # Per timeframe:
+    # 1) per cash category value (display uses positive numbers for both inflow/outflow)
+    # 2) total inflow and total outflow computed from cash_type_mapping across ALL categories
+    vals: Dict[str, Dict[str, float]] = {}
+    totals_by_tf: Dict[str, Dict[str, float]] = {}
+
+    for tf, cat, cash_type, total_value in rows:
+        tf_key = str(tf).strip()
+        cat_key = str(cat or "").strip()
+        ct = str(cash_type or "").strip().lower()
+        v_raw = float(total_value or 0.0)
+
+        # DB rule you provided:
+        # - inflow cash_value is negative
+        # - outflow cash_value is positive
+        #
+        # Table rule you want now:
+        # - inflow displayed as positive
+        # - outflow displayed as negative
+        v_abs = abs(v_raw)
+
+        v_signed = 0.0
+        if ct == "inflow":
+            v_signed = v_abs
+        elif ct == "outflow":
+            v_signed = -1.0 * v_abs
+        else:
+            v_signed = 0.0
+
+        if tf_key not in vals:
+            vals[tf_key] = {}
+        if cat_key != "":
+            vals[tf_key][cat_key] = vals[tf_key].get(cat_key, 0.0) + v_signed
+
+        if tf_key not in totals_by_tf:
+            totals_by_tf[tf_key] = {"inflow": 0.0, "outflow": 0.0}
+
+        if ct == "inflow":
+            totals_by_tf[tf_key]["inflow"] += v_abs
+        elif ct == "outflow":
+            totals_by_tf[tf_key]["outflow"] += (-1.0 * v_abs)
+
+    total_row_idx = len(tbl.rows) - 1
+    cumulative_running = 0.0
+
+    total_owner_contrib = 0.0
+    total_mortgage_loan = 0.0
+    total_rent_dividend = 0.0
+    total_total_inflow = 0.0
+
+    total_apartment_improve = 0.0
+    total_mortgage_payment = 0.0
+    total_hoa = 0.0
+    total_mgt_fee = 0.0
+    total_repairs_other = 0.0
+    total_owner_distribution = 0.0
+    total_total_outflow = 0.0
+
+    total_monthly = 0.0
+
+    data_row_count = max(0, len(tbl.rows) - 3)
+    print(f"monthly_cash_table Starting process for {data_row_count} rows.")
+
+    current = 0
+    for r in range(2, len(tbl.rows)):
+        if r == total_row_idx:
+            continue
+
+        row_label = tbl.cell(r, col_month_year).text.strip()
+        if row_label == "":
+            continue
+
+        tf_token = None
+        for token in (f"[T{n}]" for n in range(1, 14)):
+            if token in row_label:
+                tf_token = token
+                break
+
+        if tf_token is None:
+            continue
+
+        if tf_token not in token_to_label:
+            continue
+
+        current += 1
+        print(f"monthly_cash_table Currently on {current} of {data_row_count}")
+
+        new_label = row_label.replace(tf_token, token_to_label[tf_token])
+        _set_cell_text_preserve_cell_format(tbl.cell(r, col_month_year), new_label)
+        p = tbl.cell(r, col_month_year).text_frame.paragraphs[0]
+        if p.runs:
+            r0 = p.runs[0]
+            r0.font.name = "Lato"
+            r0.font.size = Pt(10)
+            r0.font.color.rgb = RGBColor(0, 0, 0)
+
+        tf_vals = vals.get(tf_token, {})
+        tf_totals = totals_by_tf.get(tf_token, {"inflow": 0.0, "outflow": 0.0})
+
+        owner_contrib = float(tf_vals.get("Owner Contribution", 0.0))
+        mortgage_loan = float(tf_vals.get("Mortgage Loan", 0.0))
+        rent_dividend = float(tf_vals.get("Rent & Dividend", 0.0))
+
+        apartment_improve = float(tf_vals.get("Apartment & Improve.", 0.0))
+        mortgage_payment = float(tf_vals.get("Mortgage Payment", 0.0))
+        hoa = float(tf_vals.get("HOA", 0.0))
+        mgt_fee = float(tf_vals.get("Mgt. Fee", 0.0))
+        repairs_other = float(tf_vals.get("Repairs & Other Expense", 0.0))
+        owner_distribution = float(tf_vals.get("Owner Distribution", 0.0))
+
+        total_inflow = float(tf_totals.get("inflow", 0.0))
+        total_outflow = float(tf_totals.get("outflow", 0.0))
+
+        monthly = total_inflow + total_outflow
+
+        if cumulative_running == 0.0:
+            cumulative_running = monthly
+        else:
+            cumulative_running = cumulative_running + monthly
+
+        if col_owner_contrib is not None:
+            _set_currency_cell(tbl.cell(r, col_owner_contrib), owner_contrib)
+        if col_mortgage_loan is not None:
+            _set_currency_cell(tbl.cell(r, col_mortgage_loan), mortgage_loan)
+        if col_rent_dividend is not None:
+            _set_currency_cell(tbl.cell(r, col_rent_dividend), rent_dividend)
+        if col_total_inflow is not None:
+            _set_currency_cell(tbl.cell(r, col_total_inflow), total_inflow)
+
+        if col_apartment_improve is not None:
+            _set_currency_cell(tbl.cell(r, col_apartment_improve), apartment_improve)
+        if col_mortgage_payment is not None:
+            _set_currency_cell(tbl.cell(r, col_mortgage_payment), mortgage_payment)
+        if col_hoa is not None:
+            _set_currency_cell(tbl.cell(r, col_hoa), hoa)
+        if col_mgt_fee is not None:
+            _set_currency_cell(tbl.cell(r, col_mgt_fee), mgt_fee)
+        if col_repairs_other is not None:
+            _set_currency_cell(tbl.cell(r, col_repairs_other), repairs_other)
+        if col_owner_distribution is not None:
+            _set_currency_cell(tbl.cell(r, col_owner_distribution), owner_distribution)
+        if col_total_outflow is not None:
+            _set_currency_cell(tbl.cell(r, col_total_outflow), total_outflow)
+
+        if col_monthly is not None:
+            _set_currency_cell(tbl.cell(r, col_monthly), monthly)
+        if col_cumulative is not None:
+            _set_currency_cell(tbl.cell(r, col_cumulative), cumulative_running)
+
+        total_owner_contrib += owner_contrib
+        total_mortgage_loan += mortgage_loan
+        total_rent_dividend += rent_dividend
+        total_total_inflow += total_inflow
+
+        total_apartment_improve += apartment_improve
+        total_mortgage_payment += mortgage_payment
+        total_hoa += hoa
+        total_mgt_fee += mgt_fee
+        total_repairs_other += repairs_other
+        total_owner_distribution += owner_distribution
+        total_total_outflow += total_outflow
+
+        total_monthly += monthly
+
+    # To-Date Total row: sum each column (same pattern as monthly_perf_table)
+    if col_owner_contrib is not None:
+        _set_currency_cell(tbl.cell(total_row_idx, col_owner_contrib), total_owner_contrib)
+    if col_mortgage_loan is not None:
+        _set_currency_cell(tbl.cell(total_row_idx, col_mortgage_loan), total_mortgage_loan)
+    if col_rent_dividend is not None:
+        _set_currency_cell(tbl.cell(total_row_idx, col_rent_dividend), total_rent_dividend)
+    if col_total_inflow is not None:
+        _set_currency_cell(tbl.cell(total_row_idx, col_total_inflow), total_total_inflow)
+
+    if col_apartment_improve is not None:
+        _set_currency_cell(tbl.cell(total_row_idx, col_apartment_improve), total_apartment_improve)
+    if col_mortgage_payment is not None:
+        _set_currency_cell(tbl.cell(total_row_idx, col_mortgage_payment), total_mortgage_payment)
+    if col_hoa is not None:
+        _set_currency_cell(tbl.cell(total_row_idx, col_hoa), total_hoa)
+    if col_mgt_fee is not None:
+        _set_currency_cell(tbl.cell(total_row_idx, col_mgt_fee), total_mgt_fee)
+    if col_repairs_other is not None:
+        _set_currency_cell(tbl.cell(total_row_idx, col_repairs_other), total_repairs_other)
+    if col_owner_distribution is not None:
+        _set_currency_cell(tbl.cell(total_row_idx, col_owner_distribution), total_owner_distribution)
+    if col_total_outflow is not None:
+        _set_currency_cell(tbl.cell(total_row_idx, col_total_outflow), total_total_outflow)
+
+    total_monthly_all = total_total_inflow + total_total_outflow
+
+    if col_monthly is not None:
+        _set_currency_cell(tbl.cell(total_row_idx, col_monthly), total_monthly_all)
+    if col_cumulative is not None:
+        _set_currency_cell(tbl.cell(total_row_idx, col_cumulative), total_monthly_all)
+
+    print("monthly_cash_table updated.")
+
+def update_available_cash(slide: Slide, shape: BaseShape, prs: Presentation, ctx: UpdateContext) -> None:
+    if not hasattr(shape, "table"):
+        return
+
+    from pptx.dml.color import RGBColor
+
+    def _norm_header(s: str) -> str:
+        return (s or "").replace("\r", "").replace(" \n", "\n").strip()
+
+    def _fmt_currency(x: float) -> tuple[str, bool]:
+        if abs(x) < 0.5:
+            return "-", False
+        if x < 0:
+            return f"(${abs(x):,.0f})", True
+        return f"${x:,.0f}", False
+
+    def _apply_red_if_negative(cell, is_negative: bool) -> None:
+        if not is_negative:
+            return
+        try:
+            p0 = cell.text_frame.paragraphs[0]
+            if p0.runs:
+                p0.runs[0].font.color.rgb = RGBColor(255, 0, 0)
+        except Exception:
+            return
+
+    def _set_currency_cell(cell, amount: float) -> None:
+        txt, is_neg = _fmt_currency(amount)
+        _set_cell_text_preserve_cell_format(cell, txt)
+        _apply_red_if_negative(cell, is_neg)
+
+    tbl = shape.table
+
+    # Locate the header row. Some PPT tables use row 0, others use row 1 (like your other tables).
+    header_row_idx = None
+    for candidate in (0, 1):
+        if candidate >= len(tbl.rows):
+            continue
+        row_headers = [_norm_header(tbl.cell(candidate, c).text) for c in range(len(tbl.columns))]
+        if (
+            "Reserve\nAccount Balance" in row_headers
+            or "Reserve Account Balance" in row_headers
+            or "Investor\nAccount Balance" in row_headers
+            or "Investor Account Balance" in row_headers
+            or "Current\nAvailable Cash" in row_headers
+            or "Current Available Cash" in row_headers
+        ):
+            header_row_idx = candidate
+            break
+
+    if header_row_idx is None:
+        print("available_cash missing required header row")
+        return
+
+    value_row_idx = header_row_idx + 1
+    if value_row_idx >= len(tbl.rows):
+        print("available_cash missing value row beneath header row")
+        return
+
+    col_reserve = None
+    col_investor = None
+    col_available = None
+
+    for c in range(len(tbl.columns)):
+        header = _norm_header(tbl.cell(header_row_idx, c).text)
+        if header in ("Reserve\nAccount Balance", "Reserve Account Balance"):
+            col_reserve = c
+        elif header in ("Investor\nAccount Balance", "Investor Account Balance"):
+            col_investor = c
+        elif header in ("Current\nAvailable Cash", "Current Available Cash"):
+            col_available = c
+
+    if col_reserve is None or col_investor is None or col_available is None:
+        print("available_cash missing one or more required column headers")
+        return
+
+    # DB rule you provided: cash_value negative for inflow, positive for outflow.
+    # For account balances, we present positive cash as a positive number, so we flip sign.
+    sql = """
+        SELECT
+            COALESCE(SUM(CASE WHEN cash_categorization = '1180 Cash Account' THEN cash_value ELSE 0 END), 0.0) AS reserve_balance,
+            COALESCE(SUM(CASE WHEN cash_categorization = '1150 Cash Account' THEN cash_value ELSE 0 END), 0.0) AS investor_balance
+        FROM gl_agg
+        WHERE investor = ?
+          AND (timeframe IS NULL OR timeframe <> 'N/A')
+    """
+
+    con = sqlite3.connect(str(config.SQLITE_PATH))
+    row = con.execute(sql, (ctx.investor,)).fetchone()
+    con.close()
+
+    reserve_raw = float((row[0] if row and row[0] is not None else 0.0))
+    investor_raw = float((row[1] if row and row[1] is not None else 0.0))
+
+    reserve_balance = reserve_raw
+    investor_balance = investor_raw
+    current_available = reserve_balance + investor_balance
+
+    _set_currency_cell(tbl.cell(value_row_idx, col_reserve), reserve_balance)
+    _set_currency_cell(tbl.cell(value_row_idx, col_investor), investor_balance)
+    _set_currency_cell(tbl.cell(value_row_idx, col_available), current_available)
+
+    print("available_cash updated.")

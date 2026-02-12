@@ -177,6 +177,15 @@ def update_summary_title(slide: Slide, shape: BaseShape, prs: Presentation, ctx:
     count = _replace_tokens_in_shape_robust(shape, token_map)
     print(f"summary_title replacements applied: {count}")
 
+def update_cash_summary_title(slide: Slide, shape: BaseShape, prs: Presentation, ctx: UpdateContext) -> None:
+    owner_str = _get_investor_owners(ctx.investor)
+    token_map = {
+        "[Owner]": owner_str,
+        "[T1]": ctx.t1_str,
+    }
+    count = _replace_tokens_in_shape_robust(shape, token_map)
+    print(f"cash_summary_title replacements applied: {count}")
+
 def update_summary_top_text(slide: Slide, shape: BaseShape, prs: Presentation, ctx: UpdateContext) -> None:
     def _norm_header(s: str) -> str:
         return (s or "").replace("\r", "").replace(" \n", "\n").strip()
