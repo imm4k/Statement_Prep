@@ -11,6 +11,8 @@ from pptx.shapes.base import BaseShape
 from pptx.slide import Slide
 
 from ppt_objects import UpdateContext
+from ppt_objects import apply_ownership_amount
+
 
 def _owner_filter_sql(ctx: UpdateContext) -> tuple[str, tuple]:
     if ctx.owner is None or str(ctx.owner).strip() == "":
@@ -254,9 +256,13 @@ def update_summary_table(slide: Slide, shape: BaseShape, prs: Presentation, ctx:
         if unit_type == "" and col_type is not None:
             continue
 
-        est_mkt = float(market_values_by_type.get(unit_type, 0.0))
-        mortgage_bal = abs(mortgage_by_prop.get(prop_name, 0.0))
-        nav = est_mkt - mortgage_bal
+        est_mkt_raw = float(market_values_by_type.get(unit_type, 0.0))
+        mortgage_bal_raw = abs(mortgage_by_prop.get(prop_name, 0.0))
+        nav_raw = est_mkt_raw - mortgage_bal_raw
+
+        est_mkt = apply_ownership_amount(ctx, est_mkt_raw, "summary_table.estimated_market_value")
+        mortgage_bal = apply_ownership_amount(ctx, mortgage_bal_raw, "summary_table.mortgage_balance")
+        nav = apply_ownership_amount(ctx, nav_raw, "summary_table.nav")
 
         if col_est_mkt_value is not None:
             _set_currency_cell(tbl.cell(r, col_est_mkt_value), est_mkt)
@@ -491,12 +497,12 @@ def update_monthly_perf_table(slide: Slide, shape: BaseShape, prs: Presentation,
 
         tf_vals = vals.get(tf_token, {})
 
-        rent = float(tf_vals.get("Rent", 0.0))
-        dividend = float(tf_vals.get("Dividend", 0.0))
+        rent = apply_ownership_amount(ctx, float(tf_vals.get("Rent", 0.0)), "monthly_perf_table.rent")
+        dividend = apply_ownership_amount(ctx, float(tf_vals.get("Dividend", 0.0)), "monthly_perf_table.dividend")
 
-        hoa_mgt = float(tf_vals.get("HOA & Mgt. Fee", 0.0))
-        repairs_other = float(tf_vals.get("Repairs & Other Exp.", 0.0))
-        mortgage_int = float(tf_vals.get("Mortgage Interest", 0.0))
+        hoa_mgt = apply_ownership_amount(ctx, float(tf_vals.get("HOA & Mgt. Fee", 0.0)), "monthly_perf_table.hoa_mgt_fee")
+        repairs_other = apply_ownership_amount(ctx, float(tf_vals.get("Repairs & Other Exp.", 0.0)), "monthly_perf_table.repairs_other")
+        mortgage_int = apply_ownership_amount(ctx, float(tf_vals.get("Mortgage Interest", 0.0)), "monthly_perf_table.mortgage_interest")
 
         total_rev = rent + dividend
         total_exp = hoa_mgt + repairs_other + mortgage_int
@@ -795,21 +801,23 @@ def update_monthly_cash_table(slide: Slide, shape: BaseShape, prs: Presentation,
         tf_vals = vals.get(tf_token, {})
         tf_totals = totals_by_tf.get(tf_token, {"inflow": 0.0, "outflow": 0.0})
 
-        owner_contrib = float(tf_vals.get("Owner Contribution", 0.0))
-        mortgage_loan = float(tf_vals.get("Mortgage Loan", 0.0))
-        rent_dividend = float(tf_vals.get("Rent & Dividend", 0.0))
+        owner_contrib = apply_ownership_amount(ctx, float(tf_vals.get("Owner Contribution", 0.0)), "monthly_cash_table.owner_contribution")
+        mortgage_loan = apply_ownership_amount(ctx, float(tf_vals.get("Mortgage Loan", 0.0)), "monthly_cash_table.mortgage_loan")
+        rent_dividend = apply_ownership_amount(ctx, float(tf_vals.get("Rent & Dividend", 0.0)), "monthly_cash_table.rent_dividend")
 
-        hoa_mgt = float(tf_vals.get("HOA & Mgt. Fee", 0.0))
-        repairs_other = float(tf_vals.get("Repairs & Other Exp.", 0.0))
-        mortgage_interest = float(tf_vals.get("Mortgage Interest", 0.0))
-        mortgage_principal = float(
-            tf_vals.get("Mortgage Principal", tf_vals.get("Mortgage Principle", 0.0))
+        hoa_mgt = apply_ownership_amount(ctx, float(tf_vals.get("HOA & Mgt. Fee", 0.0)), "monthly_cash_table.hoa_mgt_fee")
+        repairs_other = apply_ownership_amount(ctx, float(tf_vals.get("Repairs & Other Exp.", 0.0)), "monthly_cash_table.repairs_other")
+        mortgage_interest = apply_ownership_amount(ctx, float(tf_vals.get("Mortgage Interest", 0.0)), "monthly_cash_table.mortgage_interest")
+        mortgage_principal = apply_ownership_amount(
+            ctx,
+            float(tf_vals.get("Mortgage Principal", tf_vals.get("Mortgage Principle", 0.0))),
+            "monthly_cash_table.mortgage_principal",
         )
-        apartment_improve = float(tf_vals.get("Apartment & Improve.", 0.0))
-        owner_distribution = float(tf_vals.get("Owner Distribution", 0.0))
+        apartment_improve = apply_ownership_amount(ctx, float(tf_vals.get("Apartment & Improve.", 0.0)), "monthly_cash_table.apartment_improve")
+        owner_distribution = apply_ownership_amount(ctx, float(tf_vals.get("Owner Distribution", 0.0)), "monthly_cash_table.owner_distribution")
 
-        total_inflow = float(tf_totals.get("inflow", 0.0))
-        total_outflow = float(tf_totals.get("outflow", 0.0))
+        total_inflow = apply_ownership_amount(ctx, float(tf_totals.get("inflow", 0.0)), "monthly_cash_table.total_inflow")
+        total_outflow = apply_ownership_amount(ctx, float(tf_totals.get("outflow", 0.0)), "monthly_cash_table.total_outflow")
 
         monthly = total_inflow + total_outflow
 
@@ -990,9 +998,9 @@ def update_available_cash(slide: Slide, shape: BaseShape, prs: Presentation, ctx
     reserve_raw = float((row[0] if row and row[0] is not None else 0.0))
     investor_raw = float((row[1] if row and row[1] is not None else 0.0))
 
-    reserve_balance = reserve_raw
-    investor_balance = investor_raw
-    current_available = reserve_balance + investor_balance
+    reserve_balance = apply_ownership_amount(ctx, reserve_raw, "available_cash.reserve_balance")
+    investor_balance = apply_ownership_amount(ctx, investor_raw, "available_cash.investor_balance")
+    current_available = apply_ownership_amount(ctx, reserve_raw + investor_raw, "available_cash.current_available_cash")
 
     _set_currency_cell(tbl.cell(value_row_idx, col_reserve), reserve_balance)
     _set_currency_cell(tbl.cell(value_row_idx, col_investor), investor_balance)

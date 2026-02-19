@@ -19,6 +19,8 @@ from ppt_object_logic_tables import (
     update_available_cash,
 )
 
+from ppt_object_logic_visibility import update_partial_ownership_visibility
+
 OBJECT_UPDATERS: Dict[str, ObjectUpdater] = {
     "cover_title": update_cover_title,
     "cover_subtitle": update_cover_subtitle,
@@ -29,4 +31,8 @@ OBJECT_UPDATERS: Dict[str, ObjectUpdater] = {
     "available_cash": update_available_cash,
     "monthly_cash_table": update_monthly_cash_table,
     "monthly_perf_table": update_monthly_perf_table,
+
+    "pct_owner_note": update_partial_ownership_visibility,
+    "overview_title": update_partial_ownership_visibility,
+    "pct_overview_title": update_partial_ownership_visibility,
 }

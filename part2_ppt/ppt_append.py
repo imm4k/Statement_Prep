@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+PPT_APPEND_VERBOSE = False
+
 import gc
 import time
 
@@ -14,6 +16,10 @@ def combine_presentations(base_pptx_path: str, standard_pptx_path: str, out_pptx
     import pythoncom
     import win32com.client
 
+    def _log(msg: str) -> None:
+        if PPT_APPEND_VERBOSE:
+            print(msg)
+
     def _now() -> float:
         return time.perf_counter()
 
@@ -26,19 +32,22 @@ def combine_presentations(base_pptx_path: str, standard_pptx_path: str, out_pptx
     std_src = Path(standard_pptx_path)
     out_dst = Path(out_pptx_path)
 
-    tmp_dir = out_dst.parent / "__tmp_combine_local"
+    import tempfile
+    import uuid
+
+    tmp_dir = Path(tempfile.gettempdir()) / "statement_prep_ppt" / str(uuid.uuid4())[:8]
     tmp_dir.mkdir(parents=True, exist_ok=True)
 
-    base_local = tmp_dir / f"__base__{base_src.name}"
-    std_local = tmp_dir / f"__standard__{std_src.name}"
-    out_local = tmp_dir / f"__out__{out_dst.name}"
+    base_local = tmp_dir / "__base.pptx"
+    std_local = tmp_dir / "__standard.pptx"
+    out_local = tmp_dir / "__out.pptx"
 
-    print("")
-    print("ppt_append.combine_presentations diagnostics")
-    print(f"  base_src: {base_src}")
-    print(f"  std_src:  {std_src}")
-    print(f"  out_dst:  {out_dst}")
-    print(f"  staging:  {tmp_dir}")
+    _log("")
+    _log("ppt_append.combine_presentations diagnostics")
+    _log(f"  base_src: {base_src}")
+    _log(f"  std_src:  {std_src}")
+    _log(f"  out_dst:  {out_dst}")
+    _log(f"  staging:  {tmp_dir}")
 
     t0 = _now()
     shutil.copy2(base_src, base_local)
@@ -46,8 +55,8 @@ def combine_presentations(base_pptx_path: str, standard_pptx_path: str, out_pptx
     shutil.copy2(std_src, std_local)
     t_copy_std = _now()
 
-    print(f"  copy base to local: {_fmt(t_copy_base - t0)}")
-    print(f"  copy std  to local: {_fmt(t_copy_std - t_copy_base)}")
+    _log(f"  copy base to local: {_fmt(t_copy_base - t0)}")
+    _log(f"  copy std  to local: {_fmt(t_copy_std - t_copy_base)}")
 
     pythoncom.CoInitialize()
 
@@ -65,12 +74,12 @@ def combine_presentations(base_pptx_path: str, standard_pptx_path: str, out_pptx
         except Exception:
             pass
 
-        print(f"  DispatchEx PowerPoint: {_fmt(t2 - t1)}")
+        _log(f"  DispatchEx PowerPoint: {_fmt(t2 - t1)}")
 
         t3 = _now()
         pres = ppt.Presentations.Open(str(base_local), WithWindow=False)
         t4 = _now()
-        print(f"  Open base (local): {_fmt(t4 - t3)}")
+        _log(f"  Open base (local): {_fmt(t4 - t3)}")
 
         t_std0 = _now()
         std_pres = ppt.Presentations.Open(str(std_local), WithWindow=False, ReadOnly=True)
@@ -78,13 +87,13 @@ def combine_presentations(base_pptx_path: str, standard_pptx_path: str, out_pptx
         std_pres.Close()
         std_pres = None
         t_std1 = _now()
-        print(f"  Open std for count (local): {_fmt(t_std1 - t_std0)} slides: {std_slide_count}")
+        _log(f"  Open std for count (local): {_fmt(t_std1 - t_std0)} slides: {std_slide_count}")
 
         t5 = _now()
         insert_index = pres.Slides.Count
         pres.Slides.InsertFromFile(str(std_local), insert_index, 1, std_slide_count)
         t6 = _now()
-        print(f"  InsertFromFile std (local): {_fmt(t6 - t5)}")
+        _log(f"  InsertFromFile std (local): {_fmt(t6 - t5)}")
 
         if out_local.exists():
             try:
@@ -95,7 +104,7 @@ def combine_presentations(base_pptx_path: str, standard_pptx_path: str, out_pptx
         t7 = _now()
         pres.SaveAs(str(out_local))
         t8 = _now()
-        print(f"  SaveAs out (local): {_fmt(t8 - t7)}")
+        _log(f"  SaveAs out (local): {_fmt(t8 - t7)}")
 
     finally:
         try:
@@ -125,14 +134,15 @@ def combine_presentations(base_pptx_path: str, standard_pptx_path: str, out_pptx
     out_dst.parent.mkdir(parents=True, exist_ok=True)
     shutil.copy2(out_local, out_dst)
     t10 = _now()
-    print(f"  copy out to destination: {_fmt(t10 - t9)}")
-    print(f"  total combine time: {_fmt(t10 - t0)}")
+    _log(f"  copy out to destination: {_fmt(t10 - t9)}")
+    _log(f"  total combine time: {_fmt(t10 - t0)}")
 
     try:
         shutil.rmtree(tmp_dir)
-        print("  cleaned up staging directory")
+        _log("  cleaned up staging directory")
     except Exception:
-        print("  staging directory cleanup failed")
+        _log("  staging directory cleanup failed")
+
 
 
 

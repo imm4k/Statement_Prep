@@ -11,12 +11,12 @@ from pptx.slide import Slide
 
 from ppt_objects import UpdateContext
 from ppt_text_replace import replace_tokens_in_shape
+from ppt_objects import apply_ownership_amount
 
 def _owner_filter_sql(ctx: UpdateContext) -> tuple[str, tuple]:
     if ctx.owner is None or str(ctx.owner).strip() == "":
         return "", tuple()
     return " AND owner = ? ", (str(ctx.owner).strip(),)
-
 
 def _replace_tokens_in_shape_robust(shape: BaseShape, token_map: Dict[str, str]) -> int:
     """
@@ -123,7 +123,8 @@ def _get_portfolio_total_invested(ctx: UpdateContext) -> float:
     con = sqlite3.connect(str(config.SQLITE_PATH))
     row = con.execute(sql, (ctx.investor, *owner_params)).fetchone()
     con.close()
-    return float((row[0] if row and row[0] is not None else 0.0))
+    raw = float((row[0] if row and row[0] is not None else 0.0))
+    return apply_ownership_amount(ctx, raw, "text.total_invested")
 
 def _get_portfolio_cumulative_return_amount(ctx: UpdateContext) -> float:
     owner_sql, owner_params = _owner_filter_sql(ctx)
@@ -147,9 +148,13 @@ def _get_portfolio_cumulative_return_amount(ctx: UpdateContext) -> float:
     row = con.execute(sql, (ctx.investor, *owner_params)).fetchone()
     con.close()
 
-    invested = float(row[0] or 0.0)
-    mortgage = float(row[1] or 0.0)
-    income = float(row[2] or 0.0)
+    invested_raw = float(row[0] or 0.0)
+    mortgage_raw = float(row[1] or 0.0)
+    income_raw = float(row[2] or 0.0)
+
+    invested = apply_ownership_amount(ctx, invested_raw, "text.invested")
+    mortgage = apply_ownership_amount(ctx, mortgage_raw, "text.mortgage_balance")
+    income = apply_ownership_amount(ctx, income_raw, "text.cumulative_income_total")
 
     nav = -mortgage
     return nav + income - invested
@@ -174,8 +179,8 @@ def _get_portfolio_cumulative_income(ctx: UpdateContext) -> float:
     con = sqlite3.connect(str(config.SQLITE_PATH))
     row = con.execute(sql, (ctx.investor, *owner_params)).fetchone()
     con.close()
-    return float((row[0] if row and row[0] is not None else 0.0))
-
+    raw = float((row[0] if row and row[0] is not None else 0.0))
+    return apply_ownership_amount(ctx, raw, "text.cumulative_income_timeframes")
 
 def update_summary_title(slide: Slide, shape: BaseShape, prs: Presentation, ctx: UpdateContext) -> None:
     owner_str = str(ctx.owner).strip() if ctx.owner else _get_investor_owners(ctx.investor)

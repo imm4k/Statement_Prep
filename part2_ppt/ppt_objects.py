@@ -12,13 +12,28 @@ from pptx.slide import Slide
 class UpdateContext:
     investor: str
     owner: Optional[str]
+    ownership_pct: float
+    ownership_factor: float
     statement_thru_date_dt: datetime
     statement_thru_date_str: str
     t1_str: str
 
-
 ObjectUpdater = Callable[[Slide, BaseShape, Presentation, UpdateContext], None]
 
+def apply_ownership_amount(ctx: UpdateContext, amount: float, key: str) -> float:
+    import config
+
+    if bool(getattr(config, "OWNERSHIP_FORCE_100_PCT_IN_PART2", False)):
+        return float(amount or 0.0)
+
+    if ctx.ownership_pct >= 100.0:
+        return float(amount or 0.0)
+
+    k = str(key or "").strip()
+    if k != "" and k in getattr(config, "OWNERSHIP_SCALING_EXCEPTIONS", []):
+        return float(amount or 0.0)
+
+    return float(amount or 0.0) * float(ctx.ownership_factor or 0.0)
 
 def apply_object_updates(prs: Presentation, ctx: UpdateContext) -> None:
     from ppt_object_logic import OBJECT_UPDATERS

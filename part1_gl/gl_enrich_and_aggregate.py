@@ -4,7 +4,6 @@ import pandas as pd
 
 from common.sqlite_utils import clear_table, connect, table_exists
 
-
 def ensure_agg_schema(conn, gl_agg_table: str) -> None:
     conn.execute(
         f"""
@@ -69,7 +68,7 @@ def apply_mappings_inplace(
 
         inv_rows = []
         for row in investor_table_df.itertuples(index=False, name=None):
-            investor, owner, property_name, _property, acquired, inv_type = row
+            investor, _pct_ownership, owner, property_name, _property, acquired, inv_type, *_rest = row
             inv_rows.append(
                 (
                     str(investor).strip(),
@@ -107,12 +106,7 @@ def apply_mappings_inplace(
             f"""
             UPDATE {gl_raw_table}
             SET
-                investor = (
-                    SELECT m.investor
-                    FROM _investor_map m
-                    WHERE m.property_name = {gl_raw_table}.property_name
-                    LIMIT 1
-                ),
+                investor = NULL,
                 owner = (
                     SELECT m.owner
                     FROM _investor_map m
@@ -164,7 +158,6 @@ def apply_mappings_inplace(
     finally:
         conn.close()
 
-
 def build_aggregate_table(
     db_path: str,
     gl_raw_table: str,
@@ -176,70 +169,129 @@ def build_aggregate_table(
     try:
         reset_agg_table(conn, gl_agg_table)
 
+        conn.execute("DROP TABLE IF EXISTS _inv_alloc;")
+        conn.execute(
+            """
+            CREATE TABLE _inv_alloc (
+                investor TEXT,
+                owner TEXT,
+                property_name TEXT,
+                pct_ownership REAL
+            );
+            """
+        )
+
+        alloc_rows = []
+        for row in investor_table_df[["Investor", "Owner", "Property Name", "pct_ownership"]].itertuples(index=False, name=None):
+            inv, own, prop_name, pct = row
+            alloc_rows.append((str(inv).strip(), str(own).strip(), str(prop_name).strip(), float(pct)))
+
+        conn.executemany(
+            "INSERT INTO _inv_alloc (investor, owner, property_name, pct_ownership) VALUES (?, ?, ?, ?);",
+            alloc_rows,
+        )
+
         conn.execute(
             f"""
+            WITH base AS (
+                SELECT
+                    month_start,
+                    owner,
+                    property_name,
+                    MIN(acquired) AS acquired,
+                    categorization,
+                    gl_mapping_type,
+                    cash_categorization,
+                    cash_type_mapping,
+                    COALESCE(SUM(debit), 0.0) - COALESCE(SUM(credit), 0.0) AS base_value,
+                    COALESCE(SUM(debit), 0.0) - COALESCE(SUM(credit), 0.0) AS base_cash_value,
+                    COALESCE(SUM(debit), 0.0) AS base_debit,
+                    COALESCE(SUM(credit), 0.0) AS base_credit
+                FROM {gl_raw_table}
+                GROUP BY
+                    month_start, owner, property_name, categorization, gl_mapping_type, cash_categorization, cash_type_mapping
+            )
             INSERT INTO {gl_agg_table} (
                 month_start, investor, owner, property_name, acquired,
                 categorization, gl_mapping_type, value,
                 cash_categorization, cash_value, cash_type_mapping
             )
             SELECT
-                month_start,
-                investor,
-                owner,
-                property_name,
-                MIN(acquired) AS acquired,
-                categorization,
-                gl_mapping_type,
-                COALESCE(SUM(debit), 0.0) - COALESCE(SUM(credit), 0.0) AS value,
-                cash_categorization,
-                COALESCE(SUM(debit), 0.0) - COALESCE(SUM(credit), 0.0) AS cash_value,
-                MIN(cash_type_mapping) AS cash_type_mapping
-            FROM {gl_raw_table}
-            WHERE COALESCE(cash_categorization, '') <> 'Mortgage'
-            GROUP BY
-                month_start, investor, owner, property_name, categorization, gl_mapping_type, cash_categorization
+                b.month_start,
+                a.investor,
+                b.owner,
+                b.property_name,
+                b.acquired,
+                b.categorization,
+                b.gl_mapping_type,
+                (CASE
+                    WHEN b.cash_categorization = 'Mortgage' THEN (b.base_debit - b.base_credit)
+                    ELSE b.base_value
+                 END) * (a.pct_ownership / 100.0) AS value,
+                (CASE
+                    WHEN b.cash_categorization = 'Mortgage' THEN 'Mortgage Payment'
+                    ELSE b.cash_categorization
+                 END) AS cash_categorization,
+                (CASE
+                    WHEN b.cash_categorization = 'Mortgage' THEN b.base_debit
+                    ELSE b.base_cash_value
+                 END) * (a.pct_ownership / 100.0) AS cash_value,
+                (CASE
+                    WHEN b.cash_categorization = 'Mortgage' THEN 'Outflow'
+                    ELSE b.cash_type_mapping
+                 END) AS cash_type_mapping
+            FROM base b
+            JOIN _inv_alloc a
+                ON a.owner = b.owner
+                AND a.property_name = b.property_name
+            WHERE COALESCE(b.cash_categorization, '') <> 'Mortgage'
 
             UNION ALL
 
             SELECT
-                month_start,
-                investor,
-                owner,
-                property_name,
-                MIN(acquired) AS acquired,
-                categorization,
-                gl_mapping_type,
-                COALESCE(SUM(debit), 0.0) AS value,
+                b.month_start,
+                a.investor,
+                b.owner,
+                b.property_name,
+                b.acquired,
+                b.categorization,
+                b.gl_mapping_type,
+                (b.base_debit) * (a.pct_ownership / 100.0) AS value,
                 'Mortgage Payment' AS cash_categorization,
-                COALESCE(SUM(debit), 0.0) AS cash_value,
+                (b.base_debit) * (a.pct_ownership / 100.0) AS cash_value,
                 'Outflow' AS cash_type_mapping
-            FROM {gl_raw_table}
-            WHERE cash_categorization = 'Mortgage'
-            GROUP BY
-                month_start, investor, owner, property_name, categorization, gl_mapping_type
+            FROM base b
+            JOIN _inv_alloc a
+                ON a.owner = b.owner
+                AND a.property_name = b.property_name
+            WHERE b.cash_categorization = 'Mortgage'
+            AND b.base_debit <> 0.0
 
             UNION ALL
 
             SELECT
-                month_start,
-                investor,
-                owner,
-                property_name,
-                MIN(acquired) AS acquired,
-                categorization,
-                gl_mapping_type,
-                0.0 - COALESCE(SUM(credit), 0.0) AS value,
+                b.month_start,
+                a.investor,
+                b.owner,
+                b.property_name,
+                b.acquired,
+                b.categorization,
+                b.gl_mapping_type,
+                (0.0 - b.base_credit) * (a.pct_ownership / 100.0) AS value,
                 'Mortgage Loan' AS cash_categorization,
-                COALESCE(SUM(credit), 0.0) AS cash_value,
+                (b.base_credit) * (a.pct_ownership / 100.0) AS cash_value,
                 'Inflow' AS cash_type_mapping
-            FROM {gl_raw_table}
-            WHERE cash_categorization = 'Mortgage'
-            GROUP BY
-                month_start, investor, owner, property_name, categorization, gl_mapping_type
+            FROM base b
+            JOIN _inv_alloc a
+                ON a.owner = b.owner
+                AND a.property_name = b.property_name
+            WHERE b.cash_categorization = 'Mortgage'
+            AND b.base_credit <> 0.0
             ;
             """
         )
+
+        conn.execute("DROP TABLE IF EXISTS _inv_alloc;")
 
         # Append property from Investor Table (Property Name -> Property)
         conn.execute("DROP TABLE IF EXISTS _prop_map;")
