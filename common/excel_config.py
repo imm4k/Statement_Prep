@@ -101,14 +101,14 @@ def _read_investor_table(xlsx_path: str) -> pd.DataFrame:
         engine="openpyxl",
     )
 
-    required = ["Investor", "Property", "Property Name", "Owner", "Acquired", "Type"]
+    required = ["Investor", "Owner", "Property Name", "Property", "Acquired", "Type"]
     missing = [c for c in required if c not in df.columns]
     if missing:
         raise ValueError(f"Investor Table missing required columns: {missing}")
 
     df = df[required].copy()
-    df["Property"] = df["Property"].astype(str).str.strip()
     df["Property Name"] = df["Property Name"].astype(str).str.strip()
+    df["Property"] = df["Property"].astype(str).str.strip()
 
     dup = df["Property Name"].duplicated(keep=False)
     if dup.any():

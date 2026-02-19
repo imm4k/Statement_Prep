@@ -32,7 +32,14 @@ def load_general_config(xlsx_path: Path, sheet_name: str, label_output_location:
     return GeneralConfig(statement_thru_date=statement_thru_dt, output_location=Path(str(output_location)))
 
 
-def load_investors_from_run_config(xlsx_path: Path, sheet_name: str) -> List[str]:
+@dataclass(frozen=True)
+class RunConfigRow:
+    investor: str
+    owner: str
+    standard_slides_template: str
+
+
+def load_run_config_rows(xlsx_path: Path, sheet_name: str) -> List[RunConfigRow]:
     wb = load_workbook(filename=str(xlsx_path), data_only=True)
     if sheet_name not in wb.sheetnames:
         raise ValueError(f"Missing sheet '{sheet_name}' in setup workbook.")
@@ -42,19 +49,45 @@ def load_investors_from_run_config(xlsx_path: Path, sheet_name: str) -> List[str
     if header_row_idx is None or investor_col_idx is None:
         raise ValueError("Could not find an 'Investor' header in Run Config.")
 
-    investors: List[str] = []
+    _, owner_col_idx = _find_header_cell(ws, "Owner")
+    if owner_col_idx is None:
+        raise ValueError("Could not find an 'Owner' header in Run Config.")
+
+    _, base_template_col_idx = _find_header_cell(ws, "Base Template")
+    if base_template_col_idx is None:
+        _, base_template_col_idx = _find_header_cell(ws, "Template")
+
+    rows: List[RunConfigRow] = []
     row_idx = header_row_idx + 1
+
     while True:
-        val = ws.cell(row=row_idx, column=investor_col_idx).value
-        if val is None or str(val).strip() == "":
+        investor_val = ws.cell(row=row_idx, column=investor_col_idx).value
+        if investor_val is None or str(investor_val).strip() == "":
             break
-        investors.append(str(val).strip())
+
+        owner_val = ws.cell(row=row_idx, column=owner_col_idx).value
+        if owner_val is None or str(owner_val).strip() == "":
+            raise ValueError(f"Run Config row {row_idx} has an Investor but missing Owner.")
+
+        tmpl_val = ""
+        if base_template_col_idx is not None:
+            v = ws.cell(row=row_idx, column=base_template_col_idx).value
+            tmpl_val = "" if v is None else str(v).strip()
+
+        rows.append(
+            RunConfigRow(
+                investor=str(investor_val).strip(),
+                owner=str(owner_val).strip(),
+                standard_slides_template=tmpl_val,
+            )
+        )
+
         row_idx += 1
 
-    if not investors:
-        raise ValueError("No investors found under the 'Investor' column in Run Config.")
-    return investors
+    if not rows:
+        raise ValueError("No run rows found under the 'Investor' column in Run Config.")
 
+    return rows
 
 def _find_label_value(ws, label_text: str) -> Optional[object]:
     for row in ws.iter_rows(values_only=False):

@@ -12,6 +12,21 @@ from pptx.slide import Slide
 
 from ppt_objects import UpdateContext
 
+def _owner_filter_sql(ctx: UpdateContext) -> tuple[str, tuple]:
+    if ctx.owner is None or str(ctx.owner).strip() == "":
+        return "", tuple()
+    return " AND owner = ? ", (str(ctx.owner).strip(),)
+
+
+def _coerce_date_yyyy_mm_dd(value: object) -> datetime:
+    if isinstance(value, datetime):
+        return value
+    s = str(value or "").strip()
+    if s == "":
+        raise ValueError("Empty acquired value")
+    s = s.replace("T", " ")
+    s10 = s[:10]
+    return datetime.strptime(s10, "%Y-%m-%d")
 
 def _set_cell_text_preserve_cell_format(cell, text: str) -> None:
     from pptx.dml.color import RGBColor
@@ -118,16 +133,6 @@ def update_summary_table(slide: Slide, shape: BaseShape, prs: Presentation, ctx:
         _set_cell_text_preserve_cell_format(cell, txt)
         _apply_red_if_negative(cell, is_neg)
 
-    def _fmt_percent(x: float) -> tuple[str, bool]:
-        val = x * 100.0
-        txt = f"{val:.1f}%"
-        return txt, (x < 0)
-
-    def _set_percent_cell(cell, pct: float) -> None:
-        txt, is_neg = _fmt_percent(pct)
-        _set_cell_text_preserve_cell_format(cell, txt)
-        _apply_red_if_negative(cell, is_neg)
-
     def _read_general_config_market_values() -> Dict[str, float]:
         labels = {
             "Studio": "Studio Market:",
@@ -168,14 +173,9 @@ def update_summary_table(slide: Slide, shape: BaseShape, prs: Presentation, ctx:
 
     col_property = None
     col_type = None
-    col_duration = None
-    col_total_invested = None
     col_est_mkt_value = None
     col_mortgage_balance = None
     col_nav = None
-    col_cum_income = None
-    col_cum_return = None
-    col_pct_return = None
 
     for c in range(len(tbl.columns)):
         header = _norm_header(tbl.cell(1, c).text)
@@ -184,22 +184,12 @@ def update_summary_table(slide: Slide, shape: BaseShape, prs: Presentation, ctx:
             col_property = c
         elif header == "Type":
             col_type = c
-        elif header == "Duration\n(Months)":
-            col_duration = c
-        elif header == "Total\nInvested":
-            col_total_invested = c
         elif header == "Estimated\nMarket Value":
             col_est_mkt_value = c
         elif header == "Mortgage\nBalance":
             col_mortgage_balance = c
-        elif header == "Net Asset Value (NAV)":
+        elif header in ("Net Asset Value (NAV)", "Net Asset\nValue (NAV)"):
             col_nav = c
-        elif header == "Cumulative Income":
-            col_cum_income = c
-        elif header == "Cumulative Return":
-            col_cum_return = c
-        elif header == "% Return":
-            col_pct_return = c
 
     if col_property is None:
         print("summary_table missing required column header: Property")
@@ -211,71 +201,22 @@ def update_summary_table(slide: Slide, shape: BaseShape, prs: Presentation, ctx:
 
     con = sqlite3.connect(str(config.SQLITE_PATH))
 
-    sql_durations = """
-        SELECT property, MIN(acquired)
-        FROM gl_agg
-        WHERE investor = ?
-          AND acquired IS NOT NULL
-        GROUP BY property
-    """
+    owner_sql, owner_params = _owner_filter_sql(ctx)
 
-    sql_total_invested = """
-        SELECT property,
-               ABS(SUM(value)) AS total_invested
-        FROM gl_agg
-        WHERE investor = ?
-          AND categorization = 'Total Invested'
-          AND (timeframe IS NULL OR timeframe <> 'N/A')
-        GROUP BY property
-    """
-
-    sql_mortgage_balance = """
+    sql_mortgage_balance = f"""
         SELECT property,
                ABS(SUM(value)) AS mortgage_balance
         FROM gl_agg
         WHERE investor = ?
           AND categorization = 'Mortgage Balance'
           AND (timeframe IS NULL OR timeframe <> 'N/A')
+          {owner_sql}
         GROUP BY property
     """
 
-    sql_income = """
-        SELECT property,
-               SUM(
-                   CASE
-                       WHEN UPPER(TRIM(COALESCE(gl_mapping_type, ''))) = 'REVENUE' THEN -1.0 * value
-                       WHEN UPPER(TRIM(COALESCE(gl_mapping_type, ''))) = 'EXPENSE' THEN -1.0 * value
-                       ELSE 0.0
-                   END
-               ) AS cumulative_income
-        FROM gl_agg
-        WHERE investor = ?
-          AND (timeframe IS NULL OR timeframe <> 'N/A')
-        GROUP BY property
-    """
-
-    duration_rows = con.execute(sql_durations, (ctx.investor,)).fetchall()
-    invested_rows = con.execute(sql_total_invested, (ctx.investor,)).fetchall()
-    mortgage_rows = con.execute(sql_mortgage_balance, (ctx.investor,)).fetchall()
-    income_rows = con.execute(sql_income, (ctx.investor,)).fetchall()
+    mortgage_rows = con.execute(sql_mortgage_balance, (ctx.investor, *owner_params)).fetchall()
 
     con.close()
-
-    durations: Dict[str, float] = {}
-    for prop, acquired_val in duration_rows:
-        acquired_dt = datetime.strptime(str(acquired_val)[:10], "%Y-%m-%d")
-        months = ((ctx.statement_thru_date_dt.year - acquired_dt.year) * 12) + (
-            ctx.statement_thru_date_dt.month - acquired_dt.month
-        )
-        if ctx.statement_thru_date_dt.day < acquired_dt.day:
-            months -= 1
-        durations[str(prop)] = float(months)
-
-    total_invested_by_prop: Dict[str, float] = {}
-    for prop, v in invested_rows:
-        if prop is None:
-            continue
-        total_invested_by_prop[str(prop)] = float(v or 0.0)
 
     mortgage_by_prop: Dict[str, float] = {}
     for prop, v in mortgage_rows:
@@ -283,26 +224,13 @@ def update_summary_table(slide: Slide, shape: BaseShape, prs: Presentation, ctx:
             continue
         mortgage_by_prop[str(prop)] = float(v or 0.0)
 
-    income_by_prop: Dict[str, float] = {}
-    for prop, v in income_rows:
-        if prop is None:
-            continue
-        income_by_prop[str(prop)] = float(v or 0.0)
-
-    duration_hits = 0
-    invested_hits = 0
     est_hits = 0
     mortgage_hits = 0
     nav_hits = 0
-    income_hits = 0
-    return_hits = 0
 
-    invested_total = 0.0
     est_total = 0.0
     mortgage_total = 0.0
     nav_total = 0.0
-    income_total = 0.0
-    cum_return_total = 0.0
 
     data_row_count = max(0, len(tbl.rows) - 3)
     print(f"summary_table Starting process for {data_row_count} rows.")
@@ -319,14 +247,6 @@ def update_summary_table(slide: Slide, shape: BaseShape, prs: Presentation, ctx:
         if prop_name == "":
             continue
 
-        if col_duration is not None and prop_name in durations:
-            _set_cell_text_preserve_cell_format(tbl.cell(r, col_duration), str(durations[prop_name]))
-            duration_hits += 1
-
-        total_invested = abs(total_invested_by_prop.get(prop_name, 0.0))
-        mortgage_bal = abs(mortgage_by_prop.get(prop_name, 0.0))
-        cum_income = float(income_by_prop.get(prop_name, 0.0))
-
         unit_type = ""
         if col_type is not None:
             unit_type = tbl.cell(r, col_type).text.strip()
@@ -335,13 +255,8 @@ def update_summary_table(slide: Slide, shape: BaseShape, prs: Presentation, ctx:
             continue
 
         est_mkt = float(market_values_by_type.get(unit_type, 0.0))
-
+        mortgage_bal = abs(mortgage_by_prop.get(prop_name, 0.0))
         nav = est_mkt - mortgage_bal
-        cum_return = nav + cum_income - total_invested
-
-        if col_total_invested is not None:
-            _set_currency_cell(tbl.cell(r, col_total_invested), total_invested)
-            invested_hits += 1
 
         if col_est_mkt_value is not None:
             _set_currency_cell(tbl.cell(r, col_est_mkt_value), est_mkt)
@@ -355,23 +270,9 @@ def update_summary_table(slide: Slide, shape: BaseShape, prs: Presentation, ctx:
             _set_currency_cell(tbl.cell(r, col_nav), nav)
             nav_hits += 1
 
-        if col_cum_income is not None:
-            _set_currency_cell(tbl.cell(r, col_cum_income), cum_income)
-            income_hits += 1
-
-        if col_cum_return is not None:
-            _set_currency_cell(tbl.cell(r, col_cum_return), cum_return)
-            return_hits += 1
-
-        invested_total += total_invested
         est_total += est_mkt
         mortgage_total += mortgage_bal
         nav_total += nav
-        income_total += cum_income
-        cum_return_total += cum_return
-
-    if col_total_invested is not None:
-        _set_currency_cell(tbl.cell(total_row_idx, col_total_invested), invested_total)
 
     if col_est_mkt_value is not None:
         _set_currency_cell(tbl.cell(total_row_idx, col_est_mkt_value), est_total)
@@ -382,37 +283,22 @@ def update_summary_table(slide: Slide, shape: BaseShape, prs: Presentation, ctx:
     if col_nav is not None:
         _set_currency_cell(tbl.cell(total_row_idx, col_nav), nav_total)
 
-    if col_cum_income is not None:
-        _set_currency_cell(tbl.cell(total_row_idx, col_cum_income), income_total)
-
-    if col_cum_return is not None:
-        _set_currency_cell(tbl.cell(total_row_idx, col_cum_return), cum_return_total)
-
-    if col_pct_return is not None:
-        pct = 0.0
-        if abs(invested_total) > 0.0000001:
-            pct = cum_return_total / invested_total
-        _set_percent_cell(tbl.cell(total_row_idx, col_pct_return), pct)
-
-    print(f"summary_table duration updated rows: {duration_hits}")
-    print(f"summary_table total_invested updated rows: {invested_hits}")
     print(f"summary_table estimated_market_value updated rows: {est_hits}")
     print(f"summary_table mortgage_balance updated rows: {mortgage_hits}")
     print(f"summary_table nav updated rows: {nav_hits}")
-    print(f"summary_table cumulative_income updated rows: {income_hits}")
-    print(f"summary_table cumulative_return updated rows: {return_hits}")
-
 
 def update_monthly_perf_table(slide: Slide, shape: BaseShape, prs: Presentation, ctx: UpdateContext) -> None:
     if not hasattr(shape, "table"):
         return
+
+    owner_sql, owner_params = _owner_filter_sql(ctx)
 
     from pptx.dml.color import RGBColor
     from pptx.util import Pt
     from datetime import date
 
     def _norm_header(s: str) -> str:
-        return s.replace("\r", "").replace(" \n", "\n").strip()
+        return (s or "").replace("\r", "").replace(" \n", "\n").strip()
 
     def _fmt_currency(x: float) -> tuple[str, bool]:
         if abs(x) < 0.5:
@@ -443,37 +329,36 @@ def update_monthly_perf_table(slide: Slide, shape: BaseShape, prs: Presentation,
 
     col_month_year = None
     col_rent = None
-    col_other_rev = None
+    col_dividend = None
     col_total_rev = None
-    col_mortgage = None
-    col_hoa = None
-    col_mgt_fee = None
-    col_repairs = None
-    col_other_exp = None
+    col_hoa_mgt = None
+    col_repairs_other = None
+    col_mortgage_int = None
     col_total_exp = None
     col_monthly = None
     col_cumulative = None
 
+    def _hdr_compact(s: str) -> str:
+        return _norm_header(s).replace("\n", " ").strip()
+
     for c in range(len(tbl.columns)):
         header = _norm_header(tbl.cell(1, c).text)
+        header_compact = _hdr_compact(tbl.cell(1, c).text)
+
         if header == "Month Year":
             col_month_year = c
         elif header == "Rent":
             col_rent = c
-        elif header == "Other Revenue":
-            col_other_rev = c
+        elif header == "Dividend":
+            col_dividend = c
         elif header == "Total Revenue":
             col_total_rev = c
-        elif header in "Mortgage Interest":
-            col_mortgage = c
-        elif header == "HOA":
-            col_hoa = c
-        elif header == "Mgt. Fee":
-            col_mgt_fee = c
-        elif header == "Repairs Exp.":
-            col_repairs = c
-        elif header == "Other Expense":
-            col_other_exp = c
+        elif header_compact == "HOA & Mgt. Fee":
+            col_hoa_mgt = c
+        elif header_compact == "Repairs & Other Exp.":
+            col_repairs_other = c
+        elif header_compact == "Mortgage Interest":
+            col_mortgage_int = c
         elif header == "Total Expenses":
             col_total_exp = c
         elif header == "Monthly":
@@ -489,18 +374,19 @@ def update_monthly_perf_table(slide: Slide, shape: BaseShape, prs: Presentation,
     tf_list_sql = ",".join([f"'{tf}'" for tf in timeframes])
 
     sql_tf_months = f"""
-        SELECT timeframe, MAX(month_start) AS month_start
-        FROM gl_agg
-        WHERE investor = ?
-          AND timeframe IS NOT NULL
-          AND timeframe <> 'N/A'
-          AND timeframe IN ({tf_list_sql})
-          AND month_start IS NOT NULL
-        GROUP BY timeframe
-    """
+            SELECT timeframe, MAX(month_start) AS month_start
+            FROM gl_agg
+            WHERE investor = ?
+            AND timeframe IS NOT NULL
+            AND timeframe <> 'N/A'
+            AND timeframe IN ({tf_list_sql})
+            AND month_start IS NOT NULL
+            {owner_sql}
+            GROUP BY timeframe
+        """
 
     con = sqlite3.connect(str(config.SQLITE_PATH))
-    tf_rows = con.execute(sql_tf_months, (ctx.investor,)).fetchall()
+    tf_rows = con.execute(sql_tf_months, (ctx.investor, *owner_params)).fetchall()
     con.close()
 
     token_to_month_start: Dict[str, date] = {}
@@ -521,27 +407,26 @@ def update_monthly_perf_table(slide: Slide, shape: BaseShape, prs: Presentation,
 
     wanted_cats = (
         "Rent",
-        "Other Revenue",
-        "Mortgage",
-        "HOA",
-        "Mgt. Fee",
-        "Repairs Exp.",
-        "Other Expense",
+        "Dividend",
+        "HOA & Mgt. Fee",
+        "Repairs & Other Exp.",
+        "Mortgage Interest",
     )
 
     placeholders = ",".join(["?"] * len(wanted_cats))
     sql = f"""
-        SELECT timeframe, categorization, gl_mapping_type, SUM(value) AS total_value
-        FROM gl_agg
-        WHERE investor = ?
-          AND (timeframe IS NULL OR timeframe <> 'N/A')
-          AND timeframe IN ('[T1]','[T2]','[T3]','[T4]','[T5]','[T6]','[T7]','[T8]','[T9]','[T10]','[T11]','[T12]','[T13]')
-          AND categorization IN ({placeholders})
-        GROUP BY timeframe, categorization, gl_mapping_type
-    """
+            SELECT timeframe, categorization, gl_mapping_type, SUM(value) AS total_value
+            FROM gl_agg
+            WHERE investor = ?
+            AND (timeframe IS NULL OR timeframe <> 'N/A')
+            AND timeframe IN ('[T1]','[T2]','[T3]','[T4]','[T5]','[T6]','[T7]','[T8]','[T9]','[T10]','[T11]','[T12]','[T13]')
+            AND categorization IN ({placeholders})
+            {owner_sql}
+            GROUP BY timeframe, categorization, gl_mapping_type
+        """
 
     con = sqlite3.connect(str(config.SQLITE_PATH))
-    rows = con.execute(sql, (ctx.investor, *wanted_cats)).fetchall()
+    rows = con.execute(sql, (ctx.investor, *wanted_cats, *owner_params)).fetchall()
     con.close()
 
     vals: Dict[str, Dict[str, float]] = {}
@@ -562,12 +447,10 @@ def update_monthly_perf_table(slide: Slide, shape: BaseShape, prs: Presentation,
     cumulative_running = 0.0
 
     total_rent = 0.0
-    total_other_rev = 0.0
-    total_mortgage = 0.0
-    total_hoa = 0.0
-    total_mgt_fee = 0.0
-    total_repairs = 0.0
-    total_other_exp = 0.0
+    total_dividend = 0.0
+    total_hoa_mgt = 0.0
+    total_repairs_other = 0.0
+    total_mortgage_int = 0.0
     total_monthly = 0.0
 
     data_row_count = max(0, len(tbl.rows) - 3)
@@ -606,20 +489,17 @@ def update_monthly_perf_table(slide: Slide, shape: BaseShape, prs: Presentation,
             r0.font.size = Pt(10)
             r0.font.color.rgb = RGBColor(0, 0, 0)
 
-        tf_key = tf_token
-        tf_vals = vals.get(tf_key, {})
+        tf_vals = vals.get(tf_token, {})
 
         rent = float(tf_vals.get("Rent", 0.0))
-        other_rev = float(tf_vals.get("Other Revenue", 0.0))
+        dividend = float(tf_vals.get("Dividend", 0.0))
 
-        mortgage = float(tf_vals.get("Mortgage", 0.0))
-        hoa = float(tf_vals.get("HOA", 0.0))
-        mgt_fee = float(tf_vals.get("Mgt. Fee", 0.0))
-        repairs = float(tf_vals.get("Repairs Exp.", 0.0))
-        other_exp = float(tf_vals.get("Other Expense", 0.0))
+        hoa_mgt = float(tf_vals.get("HOA & Mgt. Fee", 0.0))
+        repairs_other = float(tf_vals.get("Repairs & Other Exp.", 0.0))
+        mortgage_int = float(tf_vals.get("Mortgage Interest", 0.0))
 
-        total_rev = rent + other_rev
-        total_exp = mortgage + hoa + mgt_fee + repairs + other_exp
+        total_rev = rent + dividend
+        total_exp = hoa_mgt + repairs_other + mortgage_int
         monthly = total_rev + total_exp
 
         if cumulative_running == 0.0:
@@ -629,21 +509,17 @@ def update_monthly_perf_table(slide: Slide, shape: BaseShape, prs: Presentation,
 
         if col_rent is not None:
             _set_currency_cell(tbl.cell(r, col_rent), rent)
-        if col_other_rev is not None:
-            _set_currency_cell(tbl.cell(r, col_other_rev), other_rev)
+        if col_dividend is not None:
+            _set_currency_cell(tbl.cell(r, col_dividend), dividend)
         if col_total_rev is not None:
             _set_currency_cell(tbl.cell(r, col_total_rev), total_rev)
 
-        if col_mortgage is not None:
-            _set_currency_cell(tbl.cell(r, col_mortgage), mortgage)
-        if col_hoa is not None:
-            _set_currency_cell(tbl.cell(r, col_hoa), hoa)
-        if col_mgt_fee is not None:
-            _set_currency_cell(tbl.cell(r, col_mgt_fee), mgt_fee)
-        if col_repairs is not None:
-            _set_currency_cell(tbl.cell(r, col_repairs), repairs)
-        if col_other_exp is not None:
-            _set_currency_cell(tbl.cell(r, col_other_exp), other_exp)
+        if col_hoa_mgt is not None:
+            _set_currency_cell(tbl.cell(r, col_hoa_mgt), hoa_mgt)
+        if col_repairs_other is not None:
+            _set_currency_cell(tbl.cell(r, col_repairs_other), repairs_other)
+        if col_mortgage_int is not None:
+            _set_currency_cell(tbl.cell(r, col_mortgage_int), mortgage_int)
         if col_total_exp is not None:
             _set_currency_cell(tbl.cell(r, col_total_exp), total_exp)
 
@@ -653,42 +529,35 @@ def update_monthly_perf_table(slide: Slide, shape: BaseShape, prs: Presentation,
             _set_currency_cell(tbl.cell(r, col_cumulative), cumulative_running)
 
         total_rent += rent
-        total_other_rev += other_rev
-        total_mortgage += mortgage
-        total_hoa += hoa
-        total_mgt_fee += mgt_fee
-        total_repairs += repairs
-        total_other_exp += other_exp
-        total_monthly += monthly
+        total_dividend += dividend
+        total_hoa_mgt += hoa_mgt
+        total_repairs_other += repairs_other
+        total_mortgage_int += mortgage_int
 
-    total_rev_all = total_rent + total_other_rev
-    total_exp_all = total_mortgage + total_hoa + total_mgt_fee + total_repairs + total_other_exp
+    total_rev_all = total_rent + total_dividend
+    total_exp_all = total_hoa_mgt + total_repairs_other + total_mortgage_int
     total_monthly_all = total_rev_all + total_exp_all
 
     if col_rent is not None:
         _set_currency_cell(tbl.cell(total_row_idx, col_rent), total_rent)
-    if col_other_rev is not None:
-        _set_currency_cell(tbl.cell(total_row_idx, col_other_rev), total_other_rev)
+    if col_dividend is not None:
+        _set_currency_cell(tbl.cell(total_row_idx, col_dividend), total_dividend)
     if col_total_rev is not None:
         _set_currency_cell(tbl.cell(total_row_idx, col_total_rev), total_rev_all)
 
-    if col_mortgage is not None:
-        _set_currency_cell(tbl.cell(total_row_idx, col_mortgage), total_mortgage)
-    if col_hoa is not None:
-        _set_currency_cell(tbl.cell(total_row_idx, col_hoa), total_hoa)
-    if col_mgt_fee is not None:
-        _set_currency_cell(tbl.cell(total_row_idx, col_mgt_fee), total_mgt_fee)
-    if col_repairs is not None:
-        _set_currency_cell(tbl.cell(total_row_idx, col_repairs), total_repairs)
-    if col_other_exp is not None:
-        _set_currency_cell(tbl.cell(total_row_idx, col_other_exp), total_other_exp)
+    if col_hoa_mgt is not None:
+        _set_currency_cell(tbl.cell(total_row_idx, col_hoa_mgt), total_hoa_mgt)
+    if col_repairs_other is not None:
+        _set_currency_cell(tbl.cell(total_row_idx, col_repairs_other), total_repairs_other)
+    if col_mortgage_int is not None:
+        _set_currency_cell(tbl.cell(total_row_idx, col_mortgage_int), total_mortgage_int)
     if col_total_exp is not None:
         _set_currency_cell(tbl.cell(total_row_idx, col_total_exp), total_exp_all)
 
     if col_monthly is not None:
         _set_currency_cell(tbl.cell(total_row_idx, col_monthly), total_monthly_all)
     if col_cumulative is not None:
-        _set_currency_cell(tbl.cell(total_row_idx, col_cumulative), total_monthly_all)
+        _set_currency_cell(tbl.cell(total_row_idx, col_cumulative), cumulative_running)
 
     print("monthly_perf_table updated.")
 
@@ -696,12 +565,17 @@ def update_monthly_cash_table(slide: Slide, shape: BaseShape, prs: Presentation,
     if not hasattr(shape, "table"):
         return
 
+    owner_sql, owner_params = _owner_filter_sql(ctx)
+
     from pptx.dml.color import RGBColor
     from pptx.util import Pt
     from datetime import date
 
     def _norm_header(s: str) -> str:
-        return s.replace("\r", "").replace(" \n", "\n").strip()
+        return (s or "").replace("\r", "").replace(" \n", "\n").strip()
+
+    def _hdr_compact(s: str) -> str:
+        return _norm_header(s).replace("\n", " ").strip()
 
     def _fmt_currency(x: float) -> tuple[str, bool]:
         if abs(x) < 0.5:
@@ -735,11 +609,11 @@ def update_monthly_cash_table(slide: Slide, shape: BaseShape, prs: Presentation,
     col_mortgage_loan = None
     col_rent_dividend = None
     col_total_inflow = None
-    col_apartment_improve = None
-    col_mortgage_payment = None
-    col_hoa = None
-    col_mgt_fee = None
+    col_hoa_mgt = None
     col_repairs_other = None
+    col_mortgage_interest = None
+    col_mortgage_principal = None
+    col_apartment_improve = None
     col_owner_distribution = None
     col_total_outflow = None
     col_monthly = None
@@ -747,41 +621,36 @@ def update_monthly_cash_table(slide: Slide, shape: BaseShape, prs: Presentation,
 
     for c in range(len(tbl.columns)):
         header = _norm_header(tbl.cell(1, c).text)
+        header_compact = _hdr_compact(tbl.cell(1, c).text)
 
         if header == "Month Year":
             col_month_year = c
-        elif header == "Owner Contribution":
+        elif header_compact == "Owner Contribution":
             col_owner_contrib = c
-        elif header == "Mortgage\nLoan":
+        elif header_compact == "Mortgage Loan":
             col_mortgage_loan = c
-        elif header == "Rent & Dividend":
+        elif header_compact == "Rent & Dividend":
             col_rent_dividend = c
-        elif header in ("Total\nInflow", "Total Inflow"):
+        elif header_compact == "Total Inflow":
             col_total_inflow = c
-        elif header == "Apartment & Improve.":
-            col_apartment_improve = c
-        elif header == "Mortgage Payment":
-            col_mortgage_payment = c
-        elif header == "HOA":
-            col_hoa = c
-        elif header == "Mgt. Fee":
-            col_mgt_fee = c
-        elif header == "Repairs & Other Expense":
+        elif header_compact == "HOA & Mgt. Fee":
+            col_hoa_mgt = c
+        elif header_compact == "Repairs & Other Exp.":
             col_repairs_other = c
-        elif header == "Owner Distribution":
+        elif header_compact == "Mortgage Interest":
+            col_mortgage_interest = c
+        elif header_compact in ("Mortgage Principal", "Mortgage\nPrincipal"):
+            col_mortgage_principal = c
+        elif header_compact in ("Apartment & Improve.", "Apartment & Improve"):
+            col_apartment_improve = c
+        elif header_compact == "Owner Distribution":
             col_owner_distribution = c
-        elif header in ("Total\nOutflow", "Total Outflow"):
+        elif header_compact == "Total Outflow":
             col_total_outflow = c
-        elif header == "Monthly":
+        elif header_compact == "Monthly":
             col_monthly = c
-        elif header == "Cumulative":
+        elif header_compact == "Cumulative":
             col_cumulative = c
-        elif header == "Monthly\nCumulative":
-            # Fallback in case the header text is copied as a combined string.
-            # Assume Monthly is this column and Cumulative is the next column.
-            col_monthly = c
-            if c + 1 < len(tbl.columns):
-                col_cumulative = c + 1
 
     if col_month_year is None:
         print("monthly_cash_table missing required column header: Month Year")
@@ -791,18 +660,19 @@ def update_monthly_cash_table(slide: Slide, shape: BaseShape, prs: Presentation,
     tf_list_sql = ",".join([f"'{tf}'" for tf in timeframes])
 
     sql_tf_months = f"""
-        SELECT timeframe, MAX(month_start) AS month_start
-        FROM gl_agg
-        WHERE investor = ?
-          AND timeframe IS NOT NULL
-          AND timeframe <> 'N/A'
-          AND timeframe IN ({tf_list_sql})
-          AND month_start IS NOT NULL
-        GROUP BY timeframe
-    """
+            SELECT timeframe, MAX(month_start) AS month_start
+            FROM gl_agg
+            WHERE investor = ?
+            AND timeframe IS NOT NULL
+            AND timeframe <> 'N/A'
+            AND timeframe IN ({tf_list_sql})
+            AND month_start IS NOT NULL
+            {owner_sql}
+            GROUP BY timeframe
+        """
 
     con = sqlite3.connect(str(config.SQLITE_PATH))
-    tf_rows = con.execute(sql_tf_months, (ctx.investor,)).fetchall()
+    tf_rows = con.execute(sql_tf_months, (ctx.investor, *owner_params)).fetchall()
     con.close()
 
     token_to_month_start: Dict[str, date] = {}
@@ -822,24 +692,22 @@ def update_monthly_cash_table(slide: Slide, shape: BaseShape, prs: Presentation,
         token_to_label[tf] = _month_year_label(dt)
 
     sql = f"""
-        SELECT timeframe,
-               cash_categorization,
-               cash_type_mapping,
-               SUM(cash_value) AS total_value
-        FROM gl_agg
-        WHERE investor = ?
-          AND (timeframe IS NULL OR timeframe <> 'N/A')
-          AND timeframe IN ('[T1]','[T2]','[T3]','[T4]','[T5]','[T6]','[T7]','[T8]','[T9]','[T10]','[T11]','[T12]','[T13]')
-        GROUP BY timeframe, cash_categorization, cash_type_mapping
-    """
+            SELECT timeframe,
+                cash_categorization,
+                cash_type_mapping,
+                SUM(cash_value) AS total_value
+            FROM gl_agg
+            WHERE investor = ?
+            AND (timeframe IS NULL OR timeframe <> 'N/A')
+            AND timeframe IN ('[T1]','[T2]','[T3]','[T4]','[T5]','[T6]','[T7]','[T8]','[T9]','[T10]','[T11]','[T12]','[T13]')
+            {owner_sql}
+            GROUP BY timeframe, cash_categorization, cash_type_mapping
+        """
 
     con = sqlite3.connect(str(config.SQLITE_PATH))
-    rows = con.execute(sql, (ctx.investor,)).fetchall()
+    rows = con.execute(sql, (ctx.investor, *owner_params)).fetchall()
     con.close()
 
-    # Per timeframe:
-    # 1) per cash category value (display uses positive numbers for both inflow/outflow)
-    # 2) total inflow and total outflow computed from cash_type_mapping across ALL categories
     vals: Dict[str, Dict[str, float]] = {}
     totals_by_tf: Dict[str, Dict[str, float]] = {}
 
@@ -849,13 +717,6 @@ def update_monthly_cash_table(slide: Slide, shape: BaseShape, prs: Presentation,
         ct = str(cash_type or "").strip().lower()
         v_raw = float(total_value or 0.0)
 
-        # DB rule you provided:
-        # - inflow cash_value is negative
-        # - outflow cash_value is positive
-        #
-        # Table rule you want now:
-        # - inflow displayed as positive
-        # - outflow displayed as negative
         v_abs = abs(v_raw)
 
         v_signed = 0.0
@@ -885,17 +746,15 @@ def update_monthly_cash_table(slide: Slide, shape: BaseShape, prs: Presentation,
     total_owner_contrib = 0.0
     total_mortgage_loan = 0.0
     total_rent_dividend = 0.0
-    total_total_inflow = 0.0
+    total_inflow_all = 0.0
 
-    total_apartment_improve = 0.0
-    total_mortgage_payment = 0.0
-    total_hoa = 0.0
-    total_mgt_fee = 0.0
+    total_hoa_mgt = 0.0
     total_repairs_other = 0.0
+    total_mortgage_interest = 0.0
+    total_mortgage_principal = 0.0
+    total_apartment_improve = 0.0
     total_owner_distribution = 0.0
-    total_total_outflow = 0.0
-
-    total_monthly = 0.0
+    total_outflow_all = 0.0
 
     data_row_count = max(0, len(tbl.rows) - 3)
     print(f"monthly_cash_table Starting process for {data_row_count} rows.")
@@ -940,11 +799,13 @@ def update_monthly_cash_table(slide: Slide, shape: BaseShape, prs: Presentation,
         mortgage_loan = float(tf_vals.get("Mortgage Loan", 0.0))
         rent_dividend = float(tf_vals.get("Rent & Dividend", 0.0))
 
+        hoa_mgt = float(tf_vals.get("HOA & Mgt. Fee", 0.0))
+        repairs_other = float(tf_vals.get("Repairs & Other Exp.", 0.0))
+        mortgage_interest = float(tf_vals.get("Mortgage Interest", 0.0))
+        mortgage_principal = float(
+            tf_vals.get("Mortgage Principal", tf_vals.get("Mortgage Principle", 0.0))
+        )
         apartment_improve = float(tf_vals.get("Apartment & Improve.", 0.0))
-        mortgage_payment = float(tf_vals.get("Mortgage Payment", 0.0))
-        hoa = float(tf_vals.get("HOA", 0.0))
-        mgt_fee = float(tf_vals.get("Mgt. Fee", 0.0))
-        repairs_other = float(tf_vals.get("Repairs & Other Expense", 0.0))
         owner_distribution = float(tf_vals.get("Owner Distribution", 0.0))
 
         total_inflow = float(tf_totals.get("inflow", 0.0))
@@ -966,16 +827,16 @@ def update_monthly_cash_table(slide: Slide, shape: BaseShape, prs: Presentation,
         if col_total_inflow is not None:
             _set_currency_cell(tbl.cell(r, col_total_inflow), total_inflow)
 
-        if col_apartment_improve is not None:
-            _set_currency_cell(tbl.cell(r, col_apartment_improve), apartment_improve)
-        if col_mortgage_payment is not None:
-            _set_currency_cell(tbl.cell(r, col_mortgage_payment), mortgage_payment)
-        if col_hoa is not None:
-            _set_currency_cell(tbl.cell(r, col_hoa), hoa)
-        if col_mgt_fee is not None:
-            _set_currency_cell(tbl.cell(r, col_mgt_fee), mgt_fee)
+        if col_hoa_mgt is not None:
+            _set_currency_cell(tbl.cell(r, col_hoa_mgt), hoa_mgt)
         if col_repairs_other is not None:
             _set_currency_cell(tbl.cell(r, col_repairs_other), repairs_other)
+        if col_mortgage_interest is not None:
+            _set_currency_cell(tbl.cell(r, col_mortgage_interest), mortgage_interest)
+        if col_mortgage_principal is not None:
+            _set_currency_cell(tbl.cell(r, col_mortgage_principal), mortgage_principal)
+        if col_apartment_improve is not None:
+            _set_currency_cell(tbl.cell(r, col_apartment_improve), apartment_improve)
         if col_owner_distribution is not None:
             _set_currency_cell(tbl.cell(r, col_owner_distribution), owner_distribution)
         if col_total_outflow is not None:
@@ -989,19 +850,16 @@ def update_monthly_cash_table(slide: Slide, shape: BaseShape, prs: Presentation,
         total_owner_contrib += owner_contrib
         total_mortgage_loan += mortgage_loan
         total_rent_dividend += rent_dividend
-        total_total_inflow += total_inflow
+        total_inflow_all += total_inflow
 
-        total_apartment_improve += apartment_improve
-        total_mortgage_payment += mortgage_payment
-        total_hoa += hoa
-        total_mgt_fee += mgt_fee
+        total_hoa_mgt += hoa_mgt
         total_repairs_other += repairs_other
+        total_mortgage_interest += mortgage_interest
+        total_mortgage_principal += mortgage_principal
+        total_apartment_improve += apartment_improve
         total_owner_distribution += owner_distribution
-        total_total_outflow += total_outflow
+        total_outflow_all += total_outflow
 
-        total_monthly += monthly
-
-    # To-Date Total row: sum each column (same pattern as monthly_perf_table)
     if col_owner_contrib is not None:
         _set_currency_cell(tbl.cell(total_row_idx, col_owner_contrib), total_owner_contrib)
     if col_mortgage_loan is not None:
@@ -1009,35 +867,37 @@ def update_monthly_cash_table(slide: Slide, shape: BaseShape, prs: Presentation,
     if col_rent_dividend is not None:
         _set_currency_cell(tbl.cell(total_row_idx, col_rent_dividend), total_rent_dividend)
     if col_total_inflow is not None:
-        _set_currency_cell(tbl.cell(total_row_idx, col_total_inflow), total_total_inflow)
+        _set_currency_cell(tbl.cell(total_row_idx, col_total_inflow), total_inflow_all)
 
-    if col_apartment_improve is not None:
-        _set_currency_cell(tbl.cell(total_row_idx, col_apartment_improve), total_apartment_improve)
-    if col_mortgage_payment is not None:
-        _set_currency_cell(tbl.cell(total_row_idx, col_mortgage_payment), total_mortgage_payment)
-    if col_hoa is not None:
-        _set_currency_cell(tbl.cell(total_row_idx, col_hoa), total_hoa)
-    if col_mgt_fee is not None:
-        _set_currency_cell(tbl.cell(total_row_idx, col_mgt_fee), total_mgt_fee)
+    if col_hoa_mgt is not None:
+        _set_currency_cell(tbl.cell(total_row_idx, col_hoa_mgt), total_hoa_mgt)
     if col_repairs_other is not None:
         _set_currency_cell(tbl.cell(total_row_idx, col_repairs_other), total_repairs_other)
+    if col_mortgage_interest is not None:
+        _set_currency_cell(tbl.cell(total_row_idx, col_mortgage_interest), total_mortgage_interest)
+    if col_mortgage_principal is not None:
+        _set_currency_cell(tbl.cell(total_row_idx, col_mortgage_principal), total_mortgage_principal)
+    if col_apartment_improve is not None:
+        _set_currency_cell(tbl.cell(total_row_idx, col_apartment_improve), total_apartment_improve)
     if col_owner_distribution is not None:
         _set_currency_cell(tbl.cell(total_row_idx, col_owner_distribution), total_owner_distribution)
     if col_total_outflow is not None:
-        _set_currency_cell(tbl.cell(total_row_idx, col_total_outflow), total_total_outflow)
+        _set_currency_cell(tbl.cell(total_row_idx, col_total_outflow), total_outflow_all)
 
-    total_monthly_all = total_total_inflow + total_total_outflow
+    total_monthly_all = total_inflow_all + total_outflow_all
 
     if col_monthly is not None:
         _set_currency_cell(tbl.cell(total_row_idx, col_monthly), total_monthly_all)
     if col_cumulative is not None:
-        _set_currency_cell(tbl.cell(total_row_idx, col_cumulative), total_monthly_all)
+        _set_currency_cell(tbl.cell(total_row_idx, col_cumulative), cumulative_running)
 
     print("monthly_cash_table updated.")
 
 def update_available_cash(slide: Slide, shape: BaseShape, prs: Presentation, ctx: UpdateContext) -> None:
     if not hasattr(shape, "table"):
         return
+
+    owner_sql, owner_params = _owner_filter_sql(ctx)
 
     from pptx.dml.color import RGBColor
 
@@ -1113,17 +973,18 @@ def update_available_cash(slide: Slide, shape: BaseShape, prs: Presentation, ctx
 
     # DB rule you provided: cash_value negative for inflow, positive for outflow.
     # For account balances, we present positive cash as a positive number, so we flip sign.
-    sql = """
-        SELECT
-            COALESCE(SUM(CASE WHEN cash_categorization = '1180 Cash Account' THEN cash_value ELSE 0 END), 0.0) AS reserve_balance,
-            COALESCE(SUM(CASE WHEN cash_categorization = '1150 Cash Account' THEN cash_value ELSE 0 END), 0.0) AS investor_balance
-        FROM gl_agg
-        WHERE investor = ?
-          AND (timeframe IS NULL OR timeframe <> 'N/A')
-    """
+    sql = f"""
+            SELECT
+                COALESCE(SUM(CASE WHEN cash_categorization = '1180 Cash Account' THEN cash_value ELSE 0 END), 0.0) AS reserve_balance,
+                COALESCE(SUM(CASE WHEN cash_categorization = '1150 Cash Account' THEN cash_value ELSE 0 END), 0.0) AS investor_balance
+            FROM gl_agg
+            WHERE investor = ?
+            AND (timeframe IS NULL OR timeframe <> 'N/A')
+            {owner_sql}
+        """
 
     con = sqlite3.connect(str(config.SQLITE_PATH))
-    row = con.execute(sql, (ctx.investor,)).fetchone()
+    row = con.execute(sql, (ctx.investor, *owner_params)).fetchone()
     con.close()
 
     reserve_raw = float((row[0] if row and row[0] is not None else 0.0))

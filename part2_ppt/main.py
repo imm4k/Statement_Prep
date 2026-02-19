@@ -5,9 +5,15 @@ from pathlib import Path
 from pptx import Presentation
 
 import config
-from excel_inputs import load_general_config, load_investors_from_run_config
+from excel_inputs import load_general_config, load_run_config_rows
 from ppt_append import combine_presentations
 from ppt_objects import UpdateContext, apply_object_updates
+
+def _sanitize_filename_component(s: str) -> str:
+    bad = '<>:"/\\|?*'
+    out = "".join("_" if ch in bad else ch for ch in str(s or "").strip())
+    out = out.replace("  ", " ").strip()
+    return out
 
 def main() -> None:
     setup_xlsx = Path(config.SETUP_EXCEL_PATH)
@@ -21,7 +27,7 @@ def main() -> None:
         label_statement_thru=config.GENERAL_CONFIG_LABEL_STATEMENT_THRU_DATE,
     )
 
-    investors = load_investors_from_run_config(
+    run_rows = load_run_config_rows(
         xlsx_path=setup_xlsx,
         sheet_name=config.RUN_CONFIG_SHEET,
     )
@@ -34,35 +40,43 @@ def main() -> None:
     print(f"Statement Thru Date: {general.statement_thru_date.strftime('%Y-%m-%d')}")
     print(f"Output Location: {general.output_location}")
     print(f"Template Dir: {config.TEMPLATE_DIR}")
-    print(f"Investors to process: {len(investors)}")
+    print(f"Runs to process: {len(run_rows)}")
 
-    for idx, investor in enumerate(investors, start=1):
-        print(f"Starting investor {investor}. Currently on {idx} of {len(investors)}")
+    for idx, run in enumerate(run_rows, start=1):
+        print(
+            f"Starting run {idx} of {len(run_rows)}. Investor: {run.investor}. Owner: {run.owner}"
+        )
 
-        investor_template_name = config.INVESTOR_TEMPLATE_FORMAT.format(investor=investor)
-        investor_template_path = config.TEMPLATE_DIR / investor_template_name
-        if not investor_template_path.exists():
-            raise FileNotFoundError(f"Missing investor template: {investor_template_path}")
+        owner_for_template = str(run.owner or "").strip()
+        if owner_for_template == "":
+            raise ValueError(f"Run row missing Owner value for investor '{run.investor}'")
 
-        prs = Presentation(str(investor_template_path))
+        owner_template_name = config.OWNER_TEMPLATE_FORMAT.format(owner=owner_for_template)
+        owner_template_path = config.TEMPLATE_DIR / owner_template_name
+        if not owner_template_path.exists():
+            raise FileNotFoundError(f"Missing owner template: {owner_template_path}")
+
+        prs = Presentation(str(owner_template_path))
 
         t1_str = general.statement_thru_date.strftime("%b %Y")
 
         ctx = UpdateContext(
-            investor=investor,
-            owner=None,
+            investor=run.investor,
+            owner=run.owner,
             statement_thru_date_dt=general.statement_thru_date,
             statement_thru_date_str=general.statement_thru_date.strftime("%m/%d/%Y"),
             t1_str=t1_str,
         )
         apply_object_updates(prs, ctx)
 
-        investor_out_dir = general.output_location / investor
+        investor_out_dir = general.output_location / run.investor
         investor_out_dir.mkdir(parents=True, exist_ok=True)
+
+        owner_for_filename = _sanitize_filename_component(run.owner)
 
         out_name = config.DEFAULT_OUTPUT_FILENAME_FORMAT.format(
             statement_thru_yyyymm=statement_thru_yyyymm,
-            investor=investor,
+            owner=owner_for_filename,
         )
         out_path = investor_out_dir / out_name
 
@@ -74,15 +88,26 @@ def main() -> None:
         prs.save(str(tmp_updated_path))
         print(f"Saved temp updated deck: {tmp_updated_path}")
 
+        chosen_standard = (run.standard_slides_template or "").strip()
+        if chosen_standard == "":
+            chosen_standard = config.STANDARD_SLIDES_FILENAME
+
+        chosen_standard_path = config.TEMPLATE_DIR / chosen_standard
+        if not chosen_standard_path.exists():
+            print(
+                f"Standard slides template not found. Falling back to default. Missing: {chosen_standard_path}"
+            )
+            chosen_standard_path = config.TEMPLATE_DIR / config.STANDARD_SLIDES_FILENAME
+
         combine_presentations(
             base_pptx_path=tmp_updated_path,
-            standard_pptx_path=standard_slides_path,
+            standard_pptx_path=chosen_standard_path,
             out_pptx_path=out_path,
         )
 
         tmp_updated_path.unlink()
 
-    print("All investors completed.")
+        print("All investors completed.")
 
 
 if __name__ == "__main__":

@@ -69,7 +69,7 @@ def apply_mappings_inplace(
 
         inv_rows = []
         for row in investor_table_df.itertuples(index=False, name=None):
-            investor, _property, property_name, owner, acquired, inv_type = row
+            investor, owner, property_name, _property, acquired, inv_type = row
             inv_rows.append(
                 (
                     str(investor).strip(),

@@ -1,207 +1,227 @@
-# debug.py
 from __future__ import annotations
 
+import cProfile
+import io
 import os
+import platform
+import runpy
 import sys
+import time
 from pathlib import Path
-from typing import Optional, List, Tuple
-
-from pptx import Presentation
-
-import config
+from typing import Iterable, Optional, Tuple
 
 
-def _print_banner(title: str) -> None:
-    print("\n" + "=" * 80)
-    print(title)
-    print("=" * 80)
+def _hr() -> str:
+    return "=" * 98
 
 
-def _norm(s: str) -> str:
-    return (s or "").replace("\r", "").replace(" \n", "\n").strip()
+def _now_ms() -> float:
+    return time.perf_counter() * 1000.0
 
 
-def _guess_ppt_path() -> Optional[Path]:
-    """
-    Attempts to locate a PPTX path from config by scanning for common attribute names.
-    Falls back to searching the working directory recursively for .pptx files.
-    """
-    candidates: List[str] = []
-    for name in dir(config):
-        if not name.isupper():
-            continue
-        if "PPT" in name or "PPTX" in name or "PRESENTATION" in name:
-            candidates.append(name)
+def _fmt_ms(ms: float) -> str:
+    if ms < 1000:
+        return f"{ms:,.0f} ms"
+    return f"{ms/1000.0:,.2f} s"
 
-    preferred_names = [
-        "OUTPUT_PPTX_PATH",
-        "OUTPUT_PPT_PATH",
-        "PPTX_OUTPUT_PATH",
-        "PPT_OUTPUT_PATH",
-        "TEMPLATE_PPTX_PATH",
-        "TEMPLATE_PPT_PATH",
-        "PPTX_TEMPLATE_PATH",
-        "PPT_TEMPLATE_PATH",
-        "PRESENTATION_PATH",
-        "PPTX_PATH",
-    ]
 
-    ordered: List[str] = []
-    for n in preferred_names:
-        if hasattr(config, n):
-            ordered.append(n)
-    for n in candidates:
-        if n not in ordered:
-            ordered.append(n)
+def _safe_stat(path: Path) -> Tuple[bool, Optional[int]]:
+    try:
+        st = path.stat()
+        return True, int(st.st_size)
+    except Exception:
+        return False, None
 
-    for attr in ordered:
-        try:
-            v = getattr(config, attr)
-        except Exception:
-            continue
-        if v is None:
-            continue
-        try:
-            p = Path(str(v)).expanduser()
-        except Exception:
-            continue
-        if p.exists() and p.suffix.lower() == ".pptx":
-            print(f"Using config.{attr} -> {p}")
-            return p
 
-    # Fallback: search current folder for .pptx
-    here = Path(__file__).resolve().parent
-    pptxs = sorted(here.rglob("*.pptx"))
-    if pptxs:
-        print("No PPTX path found in config. Found PPTX files under this folder:")
-        for i, p in enumerate(pptxs[:25], start=1):
-            print(f"  {i:>2}. {p}")
-        if len(pptxs) > 25:
-            print(f"  ... plus {len(pptxs) - 25} more")
+def _time_read_head(path: Path, nbytes: int = 1024 * 1024) -> Tuple[bool, float]:
+    t0 = _now_ms()
+    try:
+        with path.open("rb") as f:
+            _ = f.read(nbytes)
+        return True, _now_ms() - t0
+    except Exception:
+        return False, _now_ms() - t0
+
+
+def _time_listdir(path: Path) -> Tuple[bool, float, int]:
+    t0 = _now_ms()
+    try:
+        items = list(path.iterdir())
+        return True, _now_ms() - t0, len(items)
+    except Exception:
+        return False, _now_ms() - t0, 0
+
+
+def _find_candidate_pptx(output_dir: Path) -> Optional[Path]:
+    if not output_dir.exists():
+        return None
+    try:
+        # Prefer non temp decks
+        pptx = sorted(
+            [p for p in output_dir.rglob("*.pptx") if "__tmp_updated_" not in p.name],
+            key=lambda p: p.stat().st_mtime,
+            reverse=True,
+        )
+        return pptx[0] if pptx else None
+    except Exception:
         return None
 
-    return None
+
+def _print_latency_checks(paths: Iterable[Tuple[str, Path]]) -> None:
+    print(_hr())
+    print("Path latency checks")
+    print(_hr())
+
+    for label, p in paths:
+        exists = p.exists()
+        ok_stat, size = _safe_stat(p)
+
+        print(f"{label}: {p}")
+        print(f"  exists: {exists}")
+
+        if exists and ok_stat and size is not None and p.is_file():
+            ok_read, ms = _time_read_head(p, 1024 * 1024)
+            print(f"  size: {size:,} bytes")
+            print(f"  read 1 MB: {('ok' if ok_read else 'failed')} in {_fmt_ms(ms)}")
+
+        if exists and p.is_dir():
+            ok_ls, ms, n = _time_listdir(p)
+            print(f"  listdir: {('ok' if ok_ls else 'failed')} in {_fmt_ms(ms)}, items: {n:,}")
+
+        print("")
 
 
-def _print_table_preview(tbl, max_rows: int = 6, max_cols: int = 10) -> None:
-    rows = len(tbl.rows)
-    cols = len(tbl.columns)
-    print(f"Table size: rows={rows}, cols={cols}")
+def _run_main_under_profile(main_py: Path) -> str:
+    pr = cProfile.Profile()
 
-    r_lim = min(rows, max_rows)
-    c_lim = min(cols, max_cols)
+    t0 = _now_ms()
+    pr.enable()
+    try:
+        # Run main.py exactly as if you executed it directly
+        runpy.run_path(str(main_py), run_name="__main__")
+    finally:
+        pr.disable()
+    total_ms = _now_ms() - t0
 
-    for r in range(r_lim):
-        cells = []
-        for c in range(c_lim):
-            t = _norm(tbl.cell(r, c).text)
-            t = t.replace("\n", "\\n")
-            if len(t) > 40:
-                t = t[:37] + "..."
-            cells.append(t)
-        print(f"row {r}: {cells}")
+    s = io.StringIO()
+    import pstats  # local import to keep top clean
 
-    if rows > r_lim:
-        print(f"... {rows - r_lim} more rows not shown")
-    if cols > c_lim:
-        print(f"... {cols - c_lim} more cols not shown")
+    ps = pstats.Stats(pr, stream=s).strip_dirs().sort_stats("cumulative")
 
+    s.write(_hr() + "\n")
+    s.write("Profile summary\n")
+    s.write(_hr() + "\n")
+    s.write(f"Total runtime: {_fmt_ms(total_ms)}\n\n")
 
-def _find_shapes(prs: Presentation, target_name: str) -> List[Tuple[int, object]]:
-    hits: List[Tuple[int, object]] = []
-    for si, slide in enumerate(prs.slides):
-        for shp in slide.shapes:
-            name = getattr(shp, "name", "")
-            if str(name) == target_name:
-                hits.append((si, shp))
-    return hits
+    # Overall top cumulative
+    s.write("Top cumulative time, all functions\n")
+    ps.print_stats(50)
 
+    # Focused filters for the slow step you care about
+    s.write("\n")
+    s.write(_hr() + "\n")
+    s.write("Focused filters, insertion, slides, shapes, images, save, zip, pptx\n")
+    s.write(_hr() + "\n")
 
-def _find_near_matches(prs: Presentation, substrings: List[str]) -> List[Tuple[int, str, bool]]:
-    out: List[Tuple[int, str, bool]] = []
-    for si, slide in enumerate(prs.slides):
-        for shp in slide.shapes:
-            nm = str(getattr(shp, "name", ""))
-            nm_low = nm.lower()
-            if all(s.lower() in nm_low for s in substrings):
-                out.append((si, nm, hasattr(shp, "table")))
-    return out
+    for pattern in [
+        "standard",
+        "insert",
+        "slide",
+        "shapes",
+        "shape",
+        "image",
+        "media",
+        "relationship",
+        "rel",
+        "save",
+        "zipfile",
+        "pptx",
+        "Presentation",
+    ]:
+        s.write(f"\nFilter contains: {pattern}\n")
+        ps.print_stats(pattern)
+
+    return s.getvalue()
 
 
 def main() -> None:
-    _print_banner("debug.py: available_cash diagnostics")
+    print("")
+    print(_hr())
+    print("debug.py: standard slide insertion performance diagnostics")
+    print(_hr())
+    print(f"Python: {platform.python_version()}")
+    print(f"Executable: {sys.executable}")
+    print(f"Platform: {platform.platform()}")
+    print(f"CWD: {Path.cwd()}")
+    script_dir = Path(__file__).resolve().parent
+    print(f"Script dir: {script_dir}")
+    print("")
 
-    print(f"Python: {sys.version.split()[0]}")
-    print(f"CWD: {os.getcwd()}")
-    print(f"Script dir: {Path(__file__).resolve().parent}")
+    # Import config if present, to locate the most relevant paths for latency checks
+    template_dir = None
+    output_dir = None
+    sqlite_path = None
 
-    _print_banner("Config scan for PPTX paths")
-    ppt_path = _guess_ppt_path()
-    if ppt_path is None:
-        print("\nCould not auto-detect which PPTX file to open.")
-        print("Paste a full path to the PPTX you expect to be updating, then press Enter.")
-        user_in = input("PPTX path: ").strip().strip('"').strip("'")
-        if not user_in:
-            print("No path provided. Exiting.")
-            return
-        ppt_path = Path(user_in).expanduser()
-        if not ppt_path.exists():
-            print(f"Path not found: {ppt_path}")
-            return
-        if ppt_path.suffix.lower() != ".pptx":
-            print(f"Not a .pptx file: {ppt_path}")
-            return
+    try:
+        import config  # type: ignore
 
-    _print_banner("Open PPTX")
-    print(f"Opening: {ppt_path}")
-    prs = Presentation(str(ppt_path))
-    print(f"Slides: {len(prs.slides)}")
+        template_dir = Path(str(getattr(config, "TEMPLATE_DIR", ""))).expanduser()
+        output_dir = Path(str(getattr(config, "OUTPUT_LOCATION", ""))).expanduser()
+        sqlite_path = Path(str(getattr(config, "SQLITE_PATH", ""))).expanduser()
+    except Exception:
+        pass
 
-    target = "available_cash"
+    # Fallbacks, still give useful checks even if config import fails
+    candidates = []
+    if template_dir:
+        candidates.append(("Template Dir", template_dir))
+    if output_dir:
+        candidates.append(("Output Location", output_dir))
+    if sqlite_path:
+        candidates.append(("SQLite", sqlite_path))
 
-    _print_banner(f"Search for shape name exactly: {target!r}")
-    hits = _find_shapes(prs, target)
-    if not hits:
-        print("NOT FOUND: No shape has name exactly 'available_cash'.")
-        print("\nNear-match search (contains 'available' and 'cash'):")
-        near = _find_near_matches(prs, ["available", "cash"])
-        if not near:
-            print("No near matches found either.")
-        else:
-            for si, nm, has_tbl in near:
-                print(f"  slide {si+1}: name={nm!r}, has_table={has_tbl}")
-        print("\nMost likely cause: the table shape name in PowerPoint is not 'available_cash'.")
+    # If output dir exists, try to find a recent pptx to sanity check file read latency
+    if output_dir and output_dir.exists():
+        pptx = _find_candidate_pptx(output_dir)
+        if pptx:
+            candidates.append(("Recent PPTX in output", pptx))
+
+    if candidates:
+        _print_latency_checks(candidates)
+    else:
+        print(_hr())
+        print("Config import did not yield paths to test.")
+        print("This script will still run main.py under profiler.")
+        print(_hr())
+        print("")
+
+    main_py = script_dir / "main.py"
+    if not main_py.exists():
+        print("ERROR: main.py not found in the same folder as debug.py")
+        print(f"Expected: {main_py}")
         return
 
-    print(f"FOUND: {len(hits)} shape(s) named 'available_cash'")
-    for si, shp in hits:
-        print(f"\nslide {si+1}:")
-        print(f"  shape id: {getattr(shp, 'shape_id', None)}")
-        print(f"  name: {getattr(shp, 'name', '')!r}")
-        print(f"  has_table: {hasattr(shp, 'table')}")
-        print(f"  shape_type: {getattr(shp, 'shape_type', None)}")
+    # Optional, reduce noise in output
+    os.environ.setdefault("PYTHONWARNINGS", "ignore")
 
-        if not hasattr(shp, "table"):
-            print("  This shape is not a table. Updater will exit early.")
-            continue
+    print(_hr())
+    print("Running main.py under cProfile")
+    print("This will produce a profile summary at the end.")
+    print(_hr())
+    print("")
 
-        tbl = shp.table
-        _print_table_preview(tbl, max_rows=6, max_cols=6)
+    prof_text = _run_main_under_profile(main_py)
 
-        _print_banner("Header row detection preview")
-        for candidate in (0, 1):
-            if candidate >= len(tbl.rows):
-                continue
-            headers = [_norm(tbl.cell(candidate, c).text) for c in range(len(tbl.columns))]
-            print(f"Row {candidate} headers:")
-            for idx, h in enumerate(headers):
-                print(f"  col {idx}: {h!r}")
+    print("")
+    print(prof_text)
 
-    _print_banner("Done")
-    print("If the shape exists and is a table but still does not update, the issue is likely:")
-    print("1) OBJECT_UPDATERS does not include 'available_cash', or")
-    print("2) The update engine is not dispatching by shape.name the way you expect, or")
-    print("3) You are running against a different PPTX than the one being inspected here.")
+    print(_hr())
+    print("Next step")
+    print(_hr())
+    print(
+        "Run this twice, once when it is fast and once when it is slow, then paste both profile summaries.\n"
+        "The delta will usually point to either zipfile save time, file reads from the template dir, or slide copy."
+    )
 
 
 if __name__ == "__main__":

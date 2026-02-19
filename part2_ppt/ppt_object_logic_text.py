@@ -12,6 +12,11 @@ from pptx.slide import Slide
 from ppt_objects import UpdateContext
 from ppt_text_replace import replace_tokens_in_shape
 
+def _owner_filter_sql(ctx: UpdateContext) -> tuple[str, tuple]:
+    if ctx.owner is None or str(ctx.owner).strip() == "":
+        return "", tuple()
+    return " AND owner = ? ", (str(ctx.owner).strip(),)
+
 
 def _replace_tokens_in_shape_robust(shape: BaseShape, token_map: Dict[str, str]) -> int:
     """
@@ -105,23 +110,24 @@ def _get_investor_owners(investor: str) -> str:
     con.close()
     return _join_owner_list_for_display([r[0] for r in rows])
 
-
-def _get_portfolio_total_invested(investor: str) -> float:
-    sql = """
+def _get_portfolio_total_invested(ctx: UpdateContext) -> float:
+    owner_sql, owner_params = _owner_filter_sql(ctx)
+    sql = f"""
         SELECT ABS(SUM(value)) AS total_invested
         FROM gl_agg
         WHERE investor = ?
           AND categorization = 'Total Invested'
           AND (timeframe IS NULL OR timeframe <> 'N/A')
+          {owner_sql}
     """
     con = sqlite3.connect(str(config.SQLITE_PATH))
-    row = con.execute(sql, (investor,)).fetchone()
+    row = con.execute(sql, (ctx.investor, *owner_params)).fetchone()
     con.close()
     return float((row[0] if row and row[0] is not None else 0.0))
 
-
-def _get_portfolio_cumulative_return_amount(investor: str) -> float:
-    sql = """
+def _get_portfolio_cumulative_return_amount(ctx: UpdateContext) -> float:
+    owner_sql, owner_params = _owner_filter_sql(ctx)
+    sql = f"""
         SELECT
             ABS(SUM(CASE WHEN categorization = 'Total Invested' THEN value ELSE 0 END)) AS invested,
             ABS(SUM(CASE WHEN categorization = 'Mortgage Balance' THEN value ELSE 0 END)) AS mortgage,
@@ -135,9 +141,10 @@ def _get_portfolio_cumulative_return_amount(investor: str) -> float:
         FROM gl_agg
         WHERE investor = ?
           AND (timeframe IS NULL OR timeframe <> 'N/A')
+          {owner_sql}
     """
     con = sqlite3.connect(str(config.SQLITE_PATH))
-    row = con.execute(sql, (investor,)).fetchone()
+    row = con.execute(sql, (ctx.investor, *owner_params)).fetchone()
     con.close()
 
     invested = float(row[0] or 0.0)
@@ -147,9 +154,9 @@ def _get_portfolio_cumulative_return_amount(investor: str) -> float:
     nav = -mortgage
     return nav + income - invested
 
-
-def _get_portfolio_cumulative_income(investor: str) -> float:
-    sql = """
+def _get_portfolio_cumulative_income(ctx: UpdateContext) -> float:
+    owner_sql, owner_params = _owner_filter_sql(ctx)
+    sql = f"""
         SELECT
             SUM(
                 CASE
@@ -162,14 +169,16 @@ def _get_portfolio_cumulative_income(investor: str) -> float:
         WHERE investor = ?
           AND (timeframe IS NULL OR timeframe <> 'N/A')
           AND timeframe IN ('[T1]','[T2]','[T3]','[T4]','[T5]','[T6]','[T7]','[T8]','[T9]','[T10]','[T11]','[T12]','[T13]')
+          {owner_sql}
     """
     con = sqlite3.connect(str(config.SQLITE_PATH))
-    row = con.execute(sql, (investor,)).fetchone()
+    row = con.execute(sql, (ctx.investor, *owner_params)).fetchone()
     con.close()
     return float((row[0] if row and row[0] is not None else 0.0))
 
+
 def update_summary_title(slide: Slide, shape: BaseShape, prs: Presentation, ctx: UpdateContext) -> None:
-    owner_str = _get_investor_owners(ctx.investor)
+    owner_str = str(ctx.owner).strip() if ctx.owner else _get_investor_owners(ctx.investor)
     token_map = {
         "[Owner]": owner_str,
         "[T1]": ctx.t1_str,
@@ -178,7 +187,7 @@ def update_summary_title(slide: Slide, shape: BaseShape, prs: Presentation, ctx:
     print(f"summary_title replacements applied: {count}")
 
 def update_cash_summary_title(slide: Slide, shape: BaseShape, prs: Presentation, ctx: UpdateContext) -> None:
-    owner_str = _get_investor_owners(ctx.investor)
+    owner_str = str(ctx.owner).strip() if ctx.owner else _get_investor_owners(ctx.investor)
     token_map = {
         "[Owner]": owner_str,
         "[T1]": ctx.t1_str,
@@ -215,7 +224,7 @@ def update_summary_top_text(slide: Slide, shape: BaseShape, prs: Presentation, c
         except Exception:
             return 0.0
 
-    owner_str = _get_investor_owners(ctx.investor)
+    owner_str = str(ctx.owner).strip() if ctx.owner else _get_investor_owners(ctx.investor)
 
     total_invested = 0.0
     pct_return = 0.0
@@ -247,7 +256,7 @@ def update_summary_top_text(slide: Slide, shape: BaseShape, prs: Presentation, c
             total_invested = abs(_parse_currency(summary_tbl.cell(total_row_idx, col_total_invested).text))
             pct_return = _parse_percent(summary_tbl.cell(total_row_idx, col_pct_return).text)
 
-    cumulative_income = _get_portfolio_cumulative_income(ctx.investor)
+    cumulative_income = _get_portfolio_cumulative_income(ctx)
 
     coc = 0.0
     if abs(total_invested) > 0.0000001:
