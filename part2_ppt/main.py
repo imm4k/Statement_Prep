@@ -1,6 +1,15 @@
 from __future__ import annotations
 
+import sys
 from pathlib import Path
+
+_THIS_DIR = Path(__file__).resolve().parent               # ...\Statement_Prep\part2_ppt
+_ROOT_DIR = _THIS_DIR.parent                              # ...\Statement_Prep
+_COMMON_DIR = _ROOT_DIR / "common"                        # ...\Statement_Prep\common
+
+for p in (str(_COMMON_DIR), str(_ROOT_DIR), str(_THIS_DIR)):
+    if p not in sys.path:
+        sys.path.insert(0, p)
 
 from pptx import Presentation
 
@@ -133,6 +142,18 @@ def main() -> None:
 
         tmp_updated_path.unlink()
         completed += 1
+
+    if bool(getattr(config, "EXPORT_MONTHLY_STMT_XLSX", False)):
+        part2_dir = Path(__file__).resolve().parent
+        root_dir = part2_dir.parent
+        common_dir = root_dir / "common"
+
+        if str(common_dir) not in sys.path:
+            sys.path.insert(0, str(common_dir))
+
+        from monthly_stmt_export import export_monthly_stmt_excel
+
+        export_monthly_stmt_excel()
 
     print(f"All investors completed. Successful runs: {completed} of {len(run_rows)}")
 

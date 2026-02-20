@@ -32,8 +32,8 @@ def _to_iso_date(series: pd.Series) -> pd.Series:
     return dt.dt.strftime("%Y-%m-%d")
 
 
-def _to_month_start_iso(series: pd.Series) -> pd.Series:
-    dt = pd.to_datetime(series.astype(str).str.strip(), format="%b %Y", errors="coerce")
+def _to_month_start_iso_from_txn_date_iso(series: pd.Series) -> pd.Series:
+    dt = pd.to_datetime(series.astype(str).str.strip(), format="%Y-%m-%d", errors="coerce")
     dt = dt.dt.to_period("M").dt.to_timestamp()
     return dt.dt.strftime("%Y-%m-%d")
 
@@ -102,8 +102,8 @@ def ingest_gl_csv_to_raw(
     df["credit"] = _coerce_numeric(df["Credit"])
     df["balance"] = _coerce_numeric(df["Balance"])
 
-    df["month_start"] = _to_month_start_iso(df["Month"])
     df["txn_date"] = _to_iso_date(df["Date"])
+    df["month_start"] = _to_month_start_iso_from_txn_date_iso(df["txn_date"])
 
     df["gl_account"] = df["GL Account"].astype(str).str.strip()
     df["gl_type"] = df["Type"].astype(str).str.strip()

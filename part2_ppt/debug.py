@@ -1,227 +1,108 @@
 from __future__ import annotations
 
-import cProfile
-import io
-import os
-import platform
-import runpy
-import sys
-import time
 from pathlib import Path
-from typing import Iterable, Optional, Tuple
+
+import pandas as pd
 
 
-def _hr() -> str:
-    return "=" * 98
+GL_CSV_PATH = Path(
+    r"H:\.shortcut-targets-by-id\1Tf1JC85Wg2bbW79jfilWWqexA8jYAOxs\CARTER Property Management\23. Operations and Administrative\Property Management\Investor Updates\2026_01\general_ledger-20260218.csv"
+)
 
+SETUP_XLSX_PATH = Path(
+    r"H:\.shortcut-targets-by-id\1Tf1JC85Wg2bbW79jfilWWqexA8jYAOxs\CARTER Property Management\0. Company Assets\Automations\Statement Prep\statement_prep_setup.xlsx"
+)
 
-def _now_ms() -> float:
-    return time.perf_counter() * 1000.0
+GL_MAPPING_SHEET = "GL Mapping"
 
+PROPERTY_NAME_FILTER = "CPM Luca/Jamie/David 2- Elle - 1558upr5a"
 
-def _fmt_ms(ms: float) -> str:
-    if ms < 1000:
-        return f"{ms:,.0f} ms"
-    return f"{ms/1000.0:,.2f} s"
+OUTPUT_DIR = Path(
+    r"H:\.shortcut-targets-by-id\1Tf1JC85Wg2bbW79jfilWWqexA8jYAOxs\CARTER Property Management\23. Operations and Administrative\Property Management\Investor Updates\2026_01\David Liang"
+)
 
-
-def _safe_stat(path: Path) -> Tuple[bool, Optional[int]]:
-    try:
-        st = path.stat()
-        return True, int(st.st_size)
-    except Exception:
-        return False, None
-
-
-def _time_read_head(path: Path, nbytes: int = 1024 * 1024) -> Tuple[bool, float]:
-    t0 = _now_ms()
-    try:
-        with path.open("rb") as f:
-            _ = f.read(nbytes)
-        return True, _now_ms() - t0
-    except Exception:
-        return False, _now_ms() - t0
-
-
-def _time_listdir(path: Path) -> Tuple[bool, float, int]:
-    t0 = _now_ms()
-    try:
-        items = list(path.iterdir())
-        return True, _now_ms() - t0, len(items)
-    except Exception:
-        return False, _now_ms() - t0, 0
-
-
-def _find_candidate_pptx(output_dir: Path) -> Optional[Path]:
-    if not output_dir.exists():
-        return None
-    try:
-        # Prefer non temp decks
-        pptx = sorted(
-            [p for p in output_dir.rglob("*.pptx") if "__tmp_updated_" not in p.name],
-            key=lambda p: p.stat().st_mtime,
-            reverse=True,
-        )
-        return pptx[0] if pptx else None
-    except Exception:
-        return None
-
-
-def _print_latency_checks(paths: Iterable[Tuple[str, Path]]) -> None:
-    print(_hr())
-    print("Path latency checks")
-    print(_hr())
-
-    for label, p in paths:
-        exists = p.exists()
-        ok_stat, size = _safe_stat(p)
-
-        print(f"{label}: {p}")
-        print(f"  exists: {exists}")
-
-        if exists and ok_stat and size is not None and p.is_file():
-            ok_read, ms = _time_read_head(p, 1024 * 1024)
-            print(f"  size: {size:,} bytes")
-            print(f"  read 1 MB: {('ok' if ok_read else 'failed')} in {_fmt_ms(ms)}")
-
-        if exists and p.is_dir():
-            ok_ls, ms, n = _time_listdir(p)
-            print(f"  listdir: {('ok' if ok_ls else 'failed')} in {_fmt_ms(ms)}, items: {n:,}")
-
-        print("")
-
-
-def _run_main_under_profile(main_py: Path) -> str:
-    pr = cProfile.Profile()
-
-    t0 = _now_ms()
-    pr.enable()
-    try:
-        # Run main.py exactly as if you executed it directly
-        runpy.run_path(str(main_py), run_name="__main__")
-    finally:
-        pr.disable()
-    total_ms = _now_ms() - t0
-
-    s = io.StringIO()
-    import pstats  # local import to keep top clean
-
-    ps = pstats.Stats(pr, stream=s).strip_dirs().sort_stats("cumulative")
-
-    s.write(_hr() + "\n")
-    s.write("Profile summary\n")
-    s.write(_hr() + "\n")
-    s.write(f"Total runtime: {_fmt_ms(total_ms)}\n\n")
-
-    # Overall top cumulative
-    s.write("Top cumulative time, all functions\n")
-    ps.print_stats(50)
-
-    # Focused filters for the slow step you care about
-    s.write("\n")
-    s.write(_hr() + "\n")
-    s.write("Focused filters, insertion, slides, shapes, images, save, zip, pptx\n")
-    s.write(_hr() + "\n")
-
-    for pattern in [
-        "standard",
-        "insert",
-        "slide",
-        "shapes",
-        "shape",
-        "image",
-        "media",
-        "relationship",
-        "rel",
-        "save",
-        "zipfile",
-        "pptx",
-        "Presentation",
-    ]:
-        s.write(f"\nFilter contains: {pattern}\n")
-        ps.print_stats(pattern)
-
-    return s.getvalue()
+OUTPUT_XLSX_NAME = "debug_gl_records_with_mapping.xlsx"
 
 
 def main() -> None:
-    print("")
-    print(_hr())
-    print("debug.py: standard slide insertion performance diagnostics")
-    print(_hr())
-    print(f"Python: {platform.python_version()}")
-    print(f"Executable: {sys.executable}")
-    print(f"Platform: {platform.platform()}")
-    print(f"CWD: {Path.cwd()}")
-    script_dir = Path(__file__).resolve().parent
-    print(f"Script dir: {script_dir}")
-    print("")
+    if not GL_CSV_PATH.exists():
+        raise FileNotFoundError(f"Missing GL CSV: {GL_CSV_PATH}")
+    if not SETUP_XLSX_PATH.exists():
+        raise FileNotFoundError(f"Missing setup workbook: {SETUP_XLSX_PATH}")
 
-    # Import config if present, to locate the most relevant paths for latency checks
-    template_dir = None
-    output_dir = None
-    sqlite_path = None
+    OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+    out_path = OUTPUT_DIR / OUTPUT_XLSX_NAME
 
-    try:
-        import config  # type: ignore
+    print("=================================================================")
+    print("debug.py: GL record filter + GL Mapping categorization join")
+    print("=================================================================")
+    print(f"GL CSV:     {GL_CSV_PATH}")
+    print(f"Setup XLSX: {SETUP_XLSX_PATH} (sheet '{GL_MAPPING_SHEET}')")
+    print(f"Filter:     Property Name == '{PROPERTY_NAME_FILTER}'")
+    print(f"Output:     {out_path}")
+    print()
 
-        template_dir = Path(str(getattr(config, "TEMPLATE_DIR", ""))).expanduser()
-        output_dir = Path(str(getattr(config, "OUTPUT_LOCATION", ""))).expanduser()
-        sqlite_path = Path(str(getattr(config, "SQLITE_PATH", ""))).expanduser()
-    except Exception:
-        pass
-
-    # Fallbacks, still give useful checks even if config import fails
-    candidates = []
-    if template_dir:
-        candidates.append(("Template Dir", template_dir))
-    if output_dir:
-        candidates.append(("Output Location", output_dir))
-    if sqlite_path:
-        candidates.append(("SQLite", sqlite_path))
-
-    # If output dir exists, try to find a recent pptx to sanity check file read latency
-    if output_dir and output_dir.exists():
-        pptx = _find_candidate_pptx(output_dir)
-        if pptx:
-            candidates.append(("Recent PPTX in output", pptx))
-
-    if candidates:
-        _print_latency_checks(candidates)
-    else:
-        print(_hr())
-        print("Config import did not yield paths to test.")
-        print("This script will still run main.py under profiler.")
-        print(_hr())
-        print("")
-
-    main_py = script_dir / "main.py"
-    if not main_py.exists():
-        print("ERROR: main.py not found in the same folder as debug.py")
-        print(f"Expected: {main_py}")
-        return
-
-    # Optional, reduce noise in output
-    os.environ.setdefault("PYTHONWARNINGS", "ignore")
-
-    print(_hr())
-    print("Running main.py under cProfile")
-    print("This will produce a profile summary at the end.")
-    print(_hr())
-    print("")
-
-    prof_text = _run_main_under_profile(main_py)
-
-    print("")
-    print(prof_text)
-
-    print(_hr())
-    print("Next step")
-    print(_hr())
-    print(
-        "Run this twice, once when it is fast and once when it is slow, then paste both profile summaries.\n"
-        "The delta will usually point to either zipfile save time, file reads from the template dir, or slide copy."
+    # User instruction: CSV row 1 is headers, actual records start on row 4
+    # Therefore skip rows 2 and 3 (1-indexed), which are indices 1 and 2 (0-indexed) after the header line.
+    print("Loading GL CSV (skipping rows 2 and 3 after header)...")
+    gl = pd.read_csv(
+        GL_CSV_PATH,
+        dtype=str,
+        header=0,
+        skiprows=[1, 2],
+        keep_default_na=False,
+        na_values=[],
     )
+    print(f"Loaded GL rows: {len(gl):,}")
+    print(f"GL columns: {list(gl.columns)}")
+    print()
+
+    required_gl_cols = ["Property Name", "GL Account"]
+    for col in required_gl_cols:
+        if col not in gl.columns:
+            raise KeyError(f"GL CSV missing required column: '{col}'")
+
+    print("Filtering GL rows by Property Name...")
+    gl_f = gl[gl["Property Name"].astype(str).str.strip() == PROPERTY_NAME_FILTER].copy()
+    print(f"Filtered rows: {len(gl_f):,}")
+    print()
+
+    print("Loading GL Mapping sheet...")
+    mapping = pd.read_excel(
+        SETUP_XLSX_PATH,
+        sheet_name=GL_MAPPING_SHEET,
+        dtype=str,
+        keep_default_na=False,
+        na_values=[],
+    )
+    print(f"Loaded GL Mapping rows: {len(mapping):,}")
+    print(f"GL Mapping columns: {list(mapping.columns)}")
+    print()
+
+    required_map_cols = ["GL Account", "Categorization", "Cash Categorization"]
+    for col in required_map_cols:
+        if col not in mapping.columns:
+            raise KeyError(f"GL Mapping sheet missing required column: '{col}'")
+
+    mapping_slim = mapping[["GL Account", "Categorization", "Cash Categorization"]].copy()
+
+    print("Joining GL rows to GL Mapping on 'GL Account'...")
+    gl_f["GL Account"] = gl_f["GL Account"].astype(str).str.strip()
+    mapping_slim["GL Account"] = mapping_slim["GL Account"].astype(str).str.strip()
+
+    out = gl_f.merge(mapping_slim, on="GL Account", how="left")
+
+    # Move new columns to the end (as requested: add columns)
+    cols = [c for c in out.columns if c not in ("Categorization", "Cash Categorization")]
+    cols += ["Categorization", "Cash Categorization"]
+    out = out[cols]
+
+    print("Writing Excel output...")
+    with pd.ExcelWriter(out_path, engine="openpyxl") as writer:
+        out.to_excel(writer, sheet_name="gl_filtered", index=False)
+
+    print()
+    print(f"Done. Wrote: {out_path}")
 
 
 if __name__ == "__main__":

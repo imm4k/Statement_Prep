@@ -41,3 +41,5 @@ PARTIAL_OWNERSHIP_VISIBILITY_RULES = {
     "overview_title": {"full": True, "partial": False},
     "pct_overview_title": {"full": False, "partial": True},
 }
+
+EXPORT_MONTHLY_STMT_XLSX = False

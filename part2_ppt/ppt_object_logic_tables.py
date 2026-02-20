@@ -297,11 +297,12 @@ def update_monthly_perf_table(slide: Slide, shape: BaseShape, prs: Presentation,
     if not hasattr(shape, "table"):
         return
 
-    owner_sql, owner_params = _owner_filter_sql(ctx)
-
     from pptx.dml.color import RGBColor
     from pptx.util import Pt
-    from datetime import date
+
+    from ppt_monthly_stmt_values import build_month_year_labels
+
+    owner_sql, owner_params = _owner_filter_sql(ctx)
 
     def _norm_header(s: str) -> str:
         return (s or "").replace("\r", "").replace(" \n", "\n").strip()
@@ -327,9 +328,6 @@ def update_monthly_perf_table(slide: Slide, shape: BaseShape, prs: Presentation,
         txt, is_neg = _fmt_currency(amount)
         _set_cell_text_preserve_cell_format(cell, txt)
         _apply_red_if_negative(cell, is_neg)
-
-    def _month_year_label(dt: date) -> str:
-        return dt.strftime("%b %Y")
 
     tbl = shape.table
 
@@ -376,40 +374,7 @@ def update_monthly_perf_table(slide: Slide, shape: BaseShape, prs: Presentation,
         print("monthly_perf_table missing required column header: Month Year")
         return
 
-    timeframes = [f"[T{n}]" for n in range(1, 14)]
-    tf_list_sql = ",".join([f"'{tf}'" for tf in timeframes])
-
-    sql_tf_months = f"""
-            SELECT timeframe, MAX(month_start) AS month_start
-            FROM gl_agg
-            WHERE investor = ?
-            AND timeframe IS NOT NULL
-            AND timeframe <> 'N/A'
-            AND timeframe IN ({tf_list_sql})
-            AND month_start IS NOT NULL
-            {owner_sql}
-            GROUP BY timeframe
-        """
-
-    con = sqlite3.connect(str(config.SQLITE_PATH))
-    tf_rows = con.execute(sql_tf_months, (ctx.investor, *owner_params)).fetchall()
-    con.close()
-
-    token_to_month_start: Dict[str, date] = {}
-    for tf, ms in tf_rows:
-        try:
-            y = int(str(ms)[:4])
-            m = int(str(ms)[5:7])
-            token_to_month_start[str(tf).strip()] = date(y, m, 1)
-        except Exception:
-            continue
-
-    token_to_label: Dict[str, str] = {}
-    for tf in timeframes:
-        dt = token_to_month_start.get(tf)
-        if dt is None:
-            continue
-        token_to_label[tf] = _month_year_label(dt)
+    token_to_label = build_month_year_labels(ctx, property_name=None)
 
     wanted_cats = (
         "Rent",
@@ -418,8 +383,8 @@ def update_monthly_perf_table(slide: Slide, shape: BaseShape, prs: Presentation,
         "Repairs & Other Exp.",
         "Mortgage Interest",
     )
-
     placeholders = ",".join(["?"] * len(wanted_cats))
+
     sql = f"""
             SELECT timeframe, categorization, gl_mapping_type, SUM(value) AS total_value
             FROM gl_agg
@@ -457,7 +422,6 @@ def update_monthly_perf_table(slide: Slide, shape: BaseShape, prs: Presentation,
     total_hoa_mgt = 0.0
     total_repairs_other = 0.0
     total_mortgage_int = 0.0
-    total_monthly = 0.0
 
     data_row_count = max(0, len(tbl.rows) - 3)
     print(f"monthly_perf_table Starting process for {data_row_count} rows.")
@@ -577,6 +541,8 @@ def update_monthly_cash_table(slide: Slide, shape: BaseShape, prs: Presentation,
     from pptx.util import Pt
     from datetime import date
 
+    from ppt_monthly_stmt_values import build_month_year_labels
+
     def _norm_header(s: str) -> str:
         return (s or "").replace("\r", "").replace(" \n", "\n").strip()
 
@@ -604,9 +570,6 @@ def update_monthly_cash_table(slide: Slide, shape: BaseShape, prs: Presentation,
         txt, is_neg = _fmt_currency(amount)
         _set_cell_text_preserve_cell_format(cell, txt)
         _apply_red_if_negative(cell, is_neg)
-
-    def _month_year_label(dt: date) -> str:
-        return dt.strftime("%b %Y")
 
     tbl = shape.table
 
@@ -662,40 +625,7 @@ def update_monthly_cash_table(slide: Slide, shape: BaseShape, prs: Presentation,
         print("monthly_cash_table missing required column header: Month Year")
         return
 
-    timeframes = [f"[T{n}]" for n in range(1, 14)]
-    tf_list_sql = ",".join([f"'{tf}'" for tf in timeframes])
-
-    sql_tf_months = f"""
-            SELECT timeframe, MAX(month_start) AS month_start
-            FROM gl_agg
-            WHERE investor = ?
-            AND timeframe IS NOT NULL
-            AND timeframe <> 'N/A'
-            AND timeframe IN ({tf_list_sql})
-            AND month_start IS NOT NULL
-            {owner_sql}
-            GROUP BY timeframe
-        """
-
-    con = sqlite3.connect(str(config.SQLITE_PATH))
-    tf_rows = con.execute(sql_tf_months, (ctx.investor, *owner_params)).fetchall()
-    con.close()
-
-    token_to_month_start: Dict[str, date] = {}
-    for tf, ms in tf_rows:
-        try:
-            y = int(str(ms)[:4])
-            m = int(str(ms)[5:7])
-            token_to_month_start[str(tf).strip()] = date(y, m, 1)
-        except Exception:
-            continue
-
-    token_to_label: Dict[str, str] = {}
-    for tf in timeframes:
-        dt = token_to_month_start.get(tf)
-        if dt is None:
-            continue
-        token_to_label[tf] = _month_year_label(dt)
+    token_to_label = build_month_year_labels(ctx, property_name=None)
 
     sql = f"""
             SELECT timeframe,
@@ -721,17 +651,27 @@ def update_monthly_cash_table(slide: Slide, shape: BaseShape, prs: Presentation,
         tf_key = str(tf).strip()
         cat_key = str(cat or "").strip()
         ct = str(cash_type or "").strip().lower()
-        v_raw = float(total_value or 0.0)
+        v_raw = -1.0 * float(total_value or 0.0)
 
-        v_abs = abs(v_raw)
-
-        v_signed = 0.0
-        if ct == "inflow":
-            v_signed = v_abs
-        elif ct == "outflow":
-            v_signed = -1.0 * v_abs
+        # Special handling: Mortgage Principal can be "Both" and must land in either
+        # "Mortgage Loan" (if positive) or "Mortgage Principal" (if negative).
+        if ct == "both" and cat_key == "Mortgage Principal":
+            if v_raw > 0:
+                cat_key = "Mortgage Loan"
+                ct_eff = "inflow"
+            elif v_raw < 0:
+                cat_key = "Mortgage Principal"
+                ct_eff = "outflow"
+            else:
+                ct_eff = ""
+            v_signed = v_raw
         else:
+            ct_eff = ct
             v_signed = 0.0
+            if ct_eff in ("inflow", "outflow"):
+                v_signed = v_raw
+            else:
+                v_signed = 0.0
 
         if tf_key not in vals:
             vals[tf_key] = {}
@@ -741,10 +681,10 @@ def update_monthly_cash_table(slide: Slide, shape: BaseShape, prs: Presentation,
         if tf_key not in totals_by_tf:
             totals_by_tf[tf_key] = {"inflow": 0.0, "outflow": 0.0}
 
-        if ct == "inflow":
-            totals_by_tf[tf_key]["inflow"] += v_abs
-        elif ct == "outflow":
-            totals_by_tf[tf_key]["outflow"] += (-1.0 * v_abs)
+        if ct_eff == "inflow":
+            totals_by_tf[tf_key]["inflow"] += v_raw
+        elif ct_eff == "outflow":
+            totals_by_tf[tf_key]["outflow"] += v_raw
 
     total_row_idx = len(tbl.rows) - 1
     cumulative_running = 0.0

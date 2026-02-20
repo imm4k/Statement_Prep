@@ -21,7 +21,6 @@ class GeneralConfig:
 class SetupConfig:
     general: GeneralConfig
     investors: List[str]
-    run_config: pd.DataFrame
     investor_table: pd.DataFrame
     gl_mapping: pd.DataFrame
 
@@ -69,59 +68,27 @@ def _read_general_config(xlsx_path: str) -> GeneralConfig:
     )
 
 
-def _read_run_config(xlsx_path: str) -> Tuple[List[str], pd.DataFrame]:
+def _read_investors(xlsx_path: str) -> List[str]:
     df = pd.read_excel(
         xlsx_path,
         sheet_name="Run Config",
         engine="openpyxl",
     )
+    if "Investor" not in df.columns:
+        raise ValueError("Run Config must include a column named Investor.")
 
-    required = ["Investor", "Owner", "% Ownership"]
-    missing = [c for c in required if c not in df.columns]
-    if missing:
-        raise ValueError(f"Run Config missing required columns: {missing}")
-
-    out = df.copy()
-    out["Investor"] = out["Investor"].astype(str).str.strip()
-    out["Owner"] = out["Owner"].astype(str).str.strip()
-
-    def _normalize_pct(v) -> float:
+    investors: List[str] = []
+    for v in df["Investor"].tolist():
         if pd.isna(v):
-            raise ValueError("Run Config % Ownership contains blank values.")
-        if isinstance(v, (int, float)):
-            x = float(v)
-            if 0 < x <= 1:
-                return x * 100.0
-            return x
+            continue
         s = str(v).strip()
-        if s.endswith("%"):
-            s = s[:-1].strip()
-        x = float(s)
-        if 0 < x <= 1:
-            return x * 100.0
-        return x
+        if s:
+            investors.append(s)
 
-    out["pct_ownership"] = out["% Ownership"].apply(_normalize_pct)
-
-    bad = out[(out["pct_ownership"] <= 0) | (out["pct_ownership"] > 100)]
-    if not bad.empty:
-        raise ValueError("Run Config % Ownership must be >0 and <=100 for all rows.")
-
-    out = out[(out["Investor"] != "") & (out["Owner"] != "")].copy()
-
-    # Drop duplicate Investor + Owner pairs, keep first
-    out = out.drop_duplicates(subset=["Investor", "Owner"], keep="first").copy()
-
-    # Validate Owner sums equal exactly 100.0, otherwise skip that Owner
-    sums = out.groupby("Owner", as_index=False)["pct_ownership"].sum()
-    valid_owners = set(sums.loc[sums["pct_ownership"] == 100.0, "Owner"].tolist())
-    out = out[out["Owner"].isin(valid_owners)].copy()
-
-    investors = sorted(out["Investor"].dropna().astype(str).str.strip().unique().tolist())
     if not investors:
-        raise ValueError("Run Config contains no valid Investor rows after validation.")
+        raise ValueError("Run Config contains no Investor values.")
 
-    return investors, out[["Investor", "Owner", "pct_ownership"]].copy()
+    return investors
 
 def _read_investor_table(xlsx_path: str) -> pd.DataFrame:
     df = pd.read_excel(
@@ -194,18 +161,17 @@ def _read_gl_mapping(xlsx_path: str) -> pd.DataFrame:
 
     return df
 
-
 def load_setup_config(xlsx_path: str) -> SetupConfig:
     general = _read_general_config(xlsx_path)
-    investors, run_config = _read_run_config(xlsx_path)
+    investors = _read_investors(xlsx_path)
     investor_table = _read_investor_table(xlsx_path)
     gl_mapping = _read_gl_mapping(xlsx_path)
 
     return SetupConfig(
         general=general,
         investors=investors,
-        run_config=run_config,
         investor_table=investor_table,
         gl_mapping=gl_mapping,
     )
+
 

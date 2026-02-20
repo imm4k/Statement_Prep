@@ -1,3 +1,7 @@
 {
-  "python.defaultInterpreterPath": "C:\\Users\\liang\\AppData\\Local\\Programs\\Python\\Python310\\python.exe"
+  "python.defaultInterpreterPath": "C:\\Users\\liang\\AppData\\Local\\Programs\\Python\\Python310\\python.exe",
+  "python.analysis.extraPaths": [
+    "${workspaceFolder}/part2_ppt",
+    "${workspaceFolder}/common"
+  ]
 }
