@@ -135,9 +135,10 @@ def main() -> None:
             chosen_standard_path = config.TEMPLATE_DIR / config.STANDARD_SLIDES_FILENAME
 
         combine_presentations(
-            base_pptx_path=tmp_updated_path,
-            standard_pptx_path=chosen_standard_path,
-            out_pptx_path=out_path,
+            base_pptx_path=str(tmp_updated_path),
+            standard_pptx_path=str(chosen_standard_path),
+            out_pptx_path=str(out_path),
+            ownership_pct=float(ownership_pct),
         )
 
         tmp_updated_path.unlink()

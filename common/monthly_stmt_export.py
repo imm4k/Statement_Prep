@@ -52,7 +52,6 @@ def export_monthly_stmt_excel() -> Path:
         "Repairs & Other Exp.",
         "Mortgage Interest",
         "Total Expenses",
-        "Monthly",
         "Cumulative",
     ]
 
@@ -71,10 +70,9 @@ def export_monthly_stmt_excel() -> Path:
         "Apartment & Improve.",
         "Owner Distribution",
         "Total Outflow",
-        "Monthly",
         "Cumulative",
     ]
-
+    
     ws_perf.append(perf_cols)
     ws_cash.append(cash_cols)
 

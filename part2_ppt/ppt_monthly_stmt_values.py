@@ -153,8 +153,9 @@ def build_monthly_perf_totals(ctx: UpdateContext, property_name: Optional[str]) 
 
     total_rev = rent + dividend
     total_exp = hoa_mgt + repairs_other + mortgage_int
+
     monthly = total_rev + total_exp
-    cumulative = monthly
+    cumulative = total_rev + total_exp
 
     return {
         "Rent": rent,
@@ -247,8 +248,9 @@ def build_monthly_cash_totals(ctx: UpdateContext, property_name: Optional[str]) 
 
     total_inflow = float(inflow_total)
     total_outflow = float(outflow_total)
+
     monthly = total_inflow + total_outflow
-    cumulative = monthly
+    cumulative = total_inflow + total_outflow
 
     return {
         "Owner Contribution": owner_contrib,

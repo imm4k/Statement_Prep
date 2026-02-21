@@ -8,7 +8,7 @@ import time
 import pythoncom
 import win32com.client
 
-def combine_presentations(base_pptx_path: str, standard_pptx_path: str, out_pptx_path: str) -> None:
+def combine_presentations(base_pptx_path: str, standard_pptx_path: str, out_pptx_path: str, ownership_pct: float) -> None:
     import shutil
     import time
     from pathlib import Path
@@ -89,11 +89,102 @@ def combine_presentations(base_pptx_path: str, standard_pptx_path: str, out_pptx
         t_std1 = _now()
         _log(f"  Open std for count (local): {_fmt(t_std1 - t_std0)} slides: {std_slide_count}")
 
+        def _apply_visibility_rules_to_presentation(pres_obj, ownership_pct_value: float) -> None:
+            # If ownership < 100: show *_pct + pct_owner_note, hide normal titles
+            # If ownership = 100: show normal titles, hide *_pct + pct_owner_note
+            from win32com.client import constants as c
+
+            is_partial = float(ownership_pct_value or 0.0) < 100.0
+
+            normal_names = {
+                "overview_title",
+                "perf_summary_title",
+                "cash_summary_title",
+            }
+            pct_names = {
+                "overview_title_pct",
+                "perf_summary_title_pct",
+                "cash_summary_title_pct",
+                "pct_owner_note",
+            }
+
+            def _should_show(shape_name: str) -> bool:
+                if shape_name in normal_names:
+                    return not is_partial
+                if shape_name in pct_names:
+                    return is_partial
+                return True
+
+            # Apply by COM Visible property (most reliable for PowerPoint)
+            for s_idx in range(1, pres_obj.Slides.Count + 1):
+                slide_obj = pres_obj.Slides(s_idx)
+                for sh_idx in range(1, slide_obj.Shapes.Count + 1):
+                    shp = slide_obj.Shapes(sh_idx)
+                    try:
+                        nm = str(shp.Name or "").strip()
+                    except Exception:
+                        continue
+                    if nm == "":
+                        continue
+                    if nm in normal_names or nm in pct_names:
+                        try:
+                            shp.Visible = c.msoTrue if _should_show(nm) else c.msoFalse
+                        except Exception:
+                            # If a shape type doesn't support Visible, skip silently
+                            pass
+
+        def _apply_visibility_rules_to_presentation(pres_obj, ownership_pct_value: float) -> None:
+            # If ownership < 100: show *_pct + pct_owner_note, hide normal titles
+            # If ownership = 100: show normal titles, hide *_pct + pct_owner_note
+            from win32com.client import constants as c
+
+            is_partial = float(ownership_pct_value or 0.0) < 100.0
+
+            normal_names = {
+                "overview_title",
+                "perf_summary_title",
+                "cash_summary_title",
+            }
+            pct_names = {
+                "overview_title_pct",
+                "perf_summary_title_pct",
+                "cash_summary_title_pct",
+                "pct_owner_note",
+            }
+
+            def _should_show(shape_name: str) -> bool:
+                if shape_name in normal_names:
+                    return not is_partial
+                if shape_name in pct_names:
+                    return is_partial
+                return True
+
+            # Apply by COM Visible property (most reliable for PowerPoint)
+            for s_idx in range(1, pres_obj.Slides.Count + 1):
+                slide_obj = pres_obj.Slides(s_idx)
+                for sh_idx in range(1, slide_obj.Shapes.Count + 1):
+                    shp = slide_obj.Shapes(sh_idx)
+                    try:
+                        nm = str(shp.Name or "").strip()
+                    except Exception:
+                        continue
+                    if nm == "":
+                        continue
+                    if nm in normal_names or nm in pct_names:
+                        try:
+                            shp.Visible = c.msoTrue if _should_show(nm) else c.msoFalse
+                        except Exception:
+                            # If a shape type doesn't support Visible, skip silently
+                            pass
+
         t5 = _now()
         insert_index = pres.Slides.Count
         pres.Slides.InsertFromFile(str(std_local), insert_index, 1, std_slide_count)
         t6 = _now()
         _log(f"  InsertFromFile std (local): {_fmt(t6 - t5)}")
+
+        # Apply visibility right before SaveAs, so the final writer (PowerPoint COM) persists it.
+        _apply_visibility_rules_to_presentation(pres, float(ownership_pct))
 
         if out_local.exists():
             try:

@@ -19,7 +19,6 @@ def _owner_filter_sql(ctx: UpdateContext) -> tuple[str, tuple]:
         return "", tuple()
     return " AND owner = ? ", (str(ctx.owner).strip(),)
 
-
 def _coerce_date_yyyy_mm_dd(value: object) -> datetime:
     if isinstance(value, datetime):
         return value
@@ -101,7 +100,6 @@ def _set_cell_text_preserve_cell_format(cell, text: str) -> None:
                 int(color_val[2:4], 16),
                 int(color_val[4:6], 16),
             )
-
 
 def update_summary_table(slide: Slide, shape: BaseShape, prs: Presentation, ctx: UpdateContext) -> None:
     if not hasattr(shape, "table"):
@@ -210,7 +208,7 @@ def update_summary_table(slide: Slide, shape: BaseShape, prs: Presentation, ctx:
                ABS(SUM(value)) AS mortgage_balance
         FROM gl_agg
         WHERE investor = ?
-          AND categorization = 'Mortgage Balance'
+          AND categorization = 'Mortgage Principal'
           AND (timeframe IS NULL OR timeframe <> 'N/A')
           {owner_sql}
         GROUP BY property
@@ -258,11 +256,12 @@ def update_summary_table(slide: Slide, shape: BaseShape, prs: Presentation, ctx:
 
         est_mkt_raw = float(market_values_by_type.get(unit_type, 0.0))
         mortgage_bal_raw = abs(mortgage_by_prop.get(prop_name, 0.0))
-        nav_raw = est_mkt_raw - mortgage_bal_raw
 
-        est_mkt = apply_ownership_amount(ctx, est_mkt_raw, "summary_table.estimated_market_value")
-        mortgage_bal = apply_ownership_amount(ctx, mortgage_bal_raw, "summary_table.mortgage_balance")
-        nav = apply_ownership_amount(ctx, nav_raw, "summary_table.nav")
+        # Part 1 already scales GL values (including Mortgage Balance). Estimated Market Value is not a GL value,
+        # so we scale it here in Part 2. NAV uses the scaled market value minus the already-scaled mortgage balance.
+        est_mkt = float(est_mkt_raw) * float(ctx.ownership_factor or 0.0)
+        mortgage_bal = float(mortgage_bal_raw)
+        nav = float(est_mkt) - float(mortgage_bal)
 
         if col_est_mkt_value is not None:
             _set_currency_cell(tbl.cell(r, col_est_mkt_value), est_mkt)
@@ -947,3 +946,491 @@ def update_available_cash(slide: Slide, shape: BaseShape, prs: Presentation, ctx
     _set_currency_cell(tbl.cell(value_row_idx, col_available), current_available)
 
     print("available_cash updated.")
+
+def update_nav_table(slide: Slide, shape: BaseShape, prs: Presentation, ctx: UpdateContext) -> None:
+    
+    if not hasattr(shape, "table"):
+        return
+
+    from openpyxl import load_workbook
+    from pptx.dml.color import RGBColor
+
+    from ppt_monthly_stmt_values import build_monthly_cash_totals
+
+    def _norm(s: str) -> str:
+        return (s or "").replace("\r", "").replace(" \n", "\n").strip()
+
+    def _norm_key(s: str) -> str:
+        return _norm(s).replace("\n", " ").strip().lower()
+
+    def _fmt_currency0(x: float) -> tuple[str, bool]:
+        if abs(x) < 0.5:
+            return "-", False
+        if x < 0:
+            return f"(${abs(x):,.0f})", True
+        return f"${x:,.0f}", False
+
+    def _fmt_pct1(x: float) -> str:
+        return f"{x * 100.0:.1f}%"
+
+    def _apply_red_if_negative(cell, is_negative: bool) -> None:
+        if not is_negative:
+            return
+        try:
+            p0 = cell.text_frame.paragraphs[0]
+            if p0.runs:
+                p0.runs[0].font.color.rgb = RGBColor(255, 0, 0)
+        except Exception:
+            return
+
+    def _set_currency_cell0(cell, amount: float) -> None:
+        txt, is_neg = _fmt_currency0(amount)
+        _set_cell_text_preserve_cell_format(cell, txt)
+        _apply_red_if_negative(cell, is_neg)
+
+    def _set_text(cell, txt: str) -> None:
+        _set_cell_text_preserve_cell_format(cell, txt)
+
+    def _read_general_config_market_values() -> Dict[str, float]:
+        labels = {
+            "Studio": "Studio Market:",
+            "1-Bed": "1-Bed Market:",
+            "2-Bed": "2-Bed Market:",
+            "3-Bed": "3-Bed Market:",
+        }
+
+        wb = load_workbook(filename=str(config.SETUP_EXCEL_PATH), data_only=True)
+        try:
+            if config.GENERAL_CONFIG_SHEET not in wb.sheetnames:
+                raise RuntimeError(f"Missing sheet: {config.GENERAL_CONFIG_SHEET}")
+
+            ws = wb[config.GENERAL_CONFIG_SHEET]
+            label_to_value: Dict[str, float] = {}
+
+            for r in range(1, ws.max_row + 1):
+                a = ws.cell(r, 1).value
+                b = ws.cell(r, 2).value
+                if a is None:
+                    continue
+                key = str(a).strip()
+                if key in labels.values():
+                    try:
+                        label_to_value[key] = float(b)
+                    except Exception:
+                        label_to_value[key] = 0.0
+
+            out: Dict[str, float] = {}
+            for unit_type, label in labels.items():
+                out[unit_type] = float(label_to_value.get(label, 0.0))
+            return out
+        finally:
+            wb.close()
+
+    def _find_summary_table(prs_: Presentation):
+        for s in prs_.slides:
+            for sh in s.shapes:
+                if getattr(sh, "name", "") == "summary_table" and hasattr(sh, "table"):
+                    return s, sh
+        return None, None
+
+    def _compute_nav_from_summary_table() -> float:
+        """
+        Computes portfolio NAV using:
+        - Estimated Market Value: derived from summary_table unit types, scaled by ctx.ownership_factor (Part 2 only)
+        - Mortgage Balance: pulled from gl_agg categorization 'Mortgage Principal' (already scaled in Part 1)
+        """
+        summary_slide, summary_shape = _find_summary_table(prs)
+        if summary_shape is None:
+            return 0.0
+
+        tbl_s = summary_shape.table
+
+        def _find_col(tbl, header_texts):
+            for c in range(len(tbl.columns)):
+                h = _norm(tbl.cell(1, c).text)
+                if h in header_texts:
+                    return c
+            return None
+
+        col_property = _find_col(tbl_s, {"Property"})
+        col_type = _find_col(tbl_s, {"Type"})
+        if col_property is None or col_type is None:
+            return 0.0
+
+        market_values_by_type = _read_general_config_market_values()
+
+        con = sqlite3.connect(str(config.SQLITE_PATH))
+        try:
+            owner_sql, owner_params = _owner_filter_sql(ctx)
+
+            sql_mortgage_balance = f"""
+                SELECT property,
+                       ABS(SUM(value)) AS mortgage_balance
+                FROM gl_agg
+                WHERE investor = ?
+                  AND categorization = 'Mortgage Principal'
+                  AND (timeframe IS NULL OR timeframe <> 'N/A')
+                  {owner_sql}
+                GROUP BY property
+            """
+
+            mortgage_rows = con.execute(sql_mortgage_balance, (ctx.investor, *owner_params)).fetchall()
+        finally:
+            con.close()
+
+        mortgage_by_prop: Dict[str, float] = {}
+        for prop, v in mortgage_rows:
+            if prop is None:
+                continue
+            mortgage_by_prop[str(prop).strip()] = float(v or 0.0)
+
+        total_row_idx = len(tbl_s.rows) - 1
+
+        est_total = 0.0
+        mortgage_total = 0.0
+
+        for r in range(2, len(tbl_s.rows)):
+            if r == total_row_idx:
+                continue
+
+            prop_name = _norm(tbl_s.cell(r, col_property).text)
+            if prop_name == "":
+                continue
+
+            unit_type = _norm(tbl_s.cell(r, col_type).text)
+            if unit_type == "":
+                continue
+
+            est_mkt_raw = float(market_values_by_type.get(unit_type, 0.0))
+            est_mkt = float(est_mkt_raw) * float(ctx.ownership_factor or 0.0)
+
+            mortgage_bal = float(abs(mortgage_by_prop.get(prop_name, 0.0)))
+
+            est_total += est_mkt
+            mortgage_total += mortgage_bal
+
+        return float(est_total - mortgage_total)
+
+    tbl = shape.table
+
+    if len(tbl.columns) < 2:
+        print("nav_table must have at least 2 columns.")
+        return
+
+    # Compute values
+    nav_value = _compute_nav_from_summary_table()
+
+    cash_totals = build_monthly_cash_totals(ctx, property_name=None)
+    total_invested = float(cash_totals.get("Owner Contribution", 0.0)) + float(cash_totals.get("Owner Distribution", 0.0))
+
+    growth = None
+    if abs(total_invested) < 0.5:
+        growth = None
+    else:
+        growth = (float(nav_value) - float(total_invested)) / float(total_invested)
+
+    # Write values by matching row labels in col 0, updating col 1
+    label_to_writer = {
+        "net asset value": ("currency", nav_value),
+        "total invested": ("currency", total_invested),
+        "total growth": ("pct", growth),
+    }
+
+    updated = 0
+    for r in range(len(tbl.rows)):
+        label = _norm(tbl.cell(r, 0).text)
+        key = _norm_key(label)
+
+        # Handle "NET ASSET\nVALUE" as well as "NET ASSET VALUE"
+        if key == "net asset value":
+            mode, val = label_to_writer["net asset value"]
+        elif key == "total invested":
+            mode, val = label_to_writer["total invested"]
+        elif key == "total growth":
+            mode, val = label_to_writer["total growth"]
+        else:
+            continue
+
+        if mode == "currency":
+            _set_currency_cell0(tbl.cell(r, 1), float(val or 0.0))
+            updated += 1
+        elif mode == "pct":
+            if val is None:
+                _set_text(tbl.cell(r, 1), "-")
+            else:
+                _set_text(tbl.cell(r, 1), _fmt_pct1(float(val)))
+            updated += 1
+
+    print(f"nav_table updated rows: {updated}")
+
+def update_ni_table(slide: Slide, shape: BaseShape, prs: Presentation, ctx: UpdateContext) -> None:
+    if not hasattr(shape, "table"):
+        return
+
+    import sqlite3
+    from pptx.dml.color import RGBColor
+
+    from ppt_monthly_stmt_values import build_month_year_labels, build_monthly_cash_totals
+
+    def _norm(s: str) -> str:
+        return (s or "").replace("\r", "").replace(" \n", "\n").strip()
+
+    def _norm_key(s: str) -> str:
+        return _norm(s).replace("\n", " ").strip().lower()
+
+    def _fmt_currency0(x: float) -> tuple[str, bool]:
+        if abs(x) < 0.5:
+            return "-", False
+        if x < 0:
+            return f"(${abs(x):,.0f})", True
+        return f"${x:,.0f}", False
+
+    def _fmt_pct1(x: float) -> str:
+        return f"{x * 100.0:.1f}%"
+
+    def _apply_red_if_negative(cell, is_negative: bool) -> None:
+        if not is_negative:
+            return
+        try:
+            p0 = cell.text_frame.paragraphs[0]
+            if p0.runs:
+                p0.runs[0].font.color.rgb = RGBColor(255, 0, 0)
+        except Exception:
+            return
+
+    def _set_currency_cell0(cell, amount: float) -> None:
+        txt, is_neg = _fmt_currency0(amount)
+        _set_cell_text_preserve_cell_format(cell, txt)
+        _apply_red_if_negative(cell, is_neg)
+
+    def _set_text(cell, txt: str) -> None:
+        _set_cell_text_preserve_cell_format(cell, txt)
+
+    tbl = shape.table
+    if len(tbl.columns) < 2:
+        print("ni_table must have at least 2 columns.")
+        return
+
+    # ni_table is investor level across all owners
+    ctx_all = UpdateContext(
+        investor=ctx.investor,
+        owner=None,
+        ownership_pct=ctx.ownership_pct,
+        ownership_factor=ctx.ownership_factor,
+        statement_thru_date_dt=ctx.statement_thru_date_dt,
+        statement_thru_date_str=ctx.statement_thru_date_str,
+        t1_str=ctx.t1_str,
+    )
+
+    token_to_label = build_month_year_labels(ctx_all, property_name=None)
+
+    # Net income per timeframe using the same categories and sign handling as build_monthly_perf_totals
+    wanted_cats = (
+        "Rent",
+        "Dividend",
+        "HOA & Mgt. Fee",
+        "Repairs & Other Exp.",
+        "Mortgage Interest",
+    )
+    placeholders = ",".join(["?"] * len(wanted_cats))
+    timeframes = [f"[T{n}]" for n in range(1, 14)]
+    tf_placeholders = ",".join(["?"] * len(timeframes))
+
+    sql = f"""
+        SELECT timeframe, categorization, gl_mapping_type, SUM(value) AS total_value
+        FROM gl_agg
+        WHERE investor = ?
+          AND (timeframe IS NULL OR timeframe <> 'N/A')
+          AND timeframe IN ({tf_placeholders})
+          AND categorization IN ({placeholders})
+        GROUP BY timeframe, categorization, gl_mapping_type
+    """
+
+    con = sqlite3.connect(str(config.SQLITE_PATH))
+    try:
+        rows = con.execute(sql, (ctx_all.investor, *timeframes, *wanted_cats)).fetchall()
+    finally:
+        con.close()
+
+    net_by_tf = {tf: 0.0 for tf in timeframes}
+
+    for tf, cat, mapping_type, total_value in rows:
+        tf_key = str(tf or "").strip()
+        if tf_key == "" or tf_key not in net_by_tf:
+            continue
+
+        mt = str(mapping_type or "").strip().lower()
+        v = float(total_value or 0.0)
+
+        if mt in ("revenue", "expense"):
+            v = -1.0 * v
+
+        net_by_tf[tf_key] += v
+
+    net_t1 = float(net_by_tf.get("[T1]", 0.0))
+    net_last12 = 0.0
+    for n in range(1, 13):
+        net_last12 += float(net_by_tf.get(f"[T{n}]", 0.0))
+
+    cash_totals = build_monthly_cash_totals(ctx_all, property_name=None)
+    total_invested = float(cash_totals.get("Owner Contribution", 0.0)) + float(cash_totals.get("Owner Distribution", 0.0))
+
+    coc = None
+    if abs(total_invested) >= 0.5:
+        coc = float(net_last12) / float(total_invested)
+
+    updated = 0
+
+    for r in range(len(tbl.rows)):
+        label_cell = tbl.cell(r, 0)
+        value_cell = tbl.cell(r, 1)
+
+        label_raw = _norm(label_cell.text)
+        key = _norm_key(label_raw)
+
+        if key in ("[t1] net income", "[t1] net income ", "[t1] net income"):
+            # Force exact label formatting: "JAN 2026\nNET INCOME"
+            t1_label = str(token_to_label.get("[T1]", "") or "").upper().strip()
+            if t1_label != "":
+                _set_text(label_cell, f"{t1_label}\nNET INCOME")
+
+                try:
+                    from pptx.dml.color import RGBColor
+                    from pptx.enum.text import PP_ALIGN, MSO_ANCHOR
+                    from pptx.util import Pt
+
+                    label_cell.vertical_anchor = MSO_ANCHOR.MIDDLE
+                    tf = label_cell.text_frame
+
+                    for i, p in enumerate(tf.paragraphs):
+                        p.alignment = PP_ALIGN.CENTER
+
+                        # Paragraph-level font settings (applies even if runs are empty)
+                        p.font.name = "Lato"
+                        p.font.size = Pt(20)
+                        p.font.color.rgb = RGBColor(255, 255, 255)
+
+                        # Bold only the second line: "NET INCOME"
+                        if i == 1:
+                            p.font.bold = True
+                        else:
+                            p.font.bold = False
+
+                        # Also apply to runs when present (some templates carry run overrides)
+                        for run in p.runs:
+                            run.font.name = "Lato"
+                            run.font.size = Pt(20)
+                            run.font.color.rgb = RGBColor(255, 255, 255)
+                            run.font.bold = (i == 1)
+                except Exception:
+                    pass
+
+            _set_currency_cell0(value_cell, net_t1)
+            updated += 1
+            continue
+
+        if key in ("net income (last 12 mo)", "net income (last 12mo)"):
+            _set_currency_cell0(value_cell, net_last12)
+            updated += 1
+            continue
+
+        if key in ("cash-on-cash (last 12 mo)", "cash on cash (last 12 mo)", "cash-on-cash (last 12mo)", "cash on cash (last 12mo)"):
+            if coc is None:
+                _set_text(value_cell, "-")
+            else:
+                _set_text(value_cell, _fmt_pct1(float(coc)))
+            updated += 1
+            continue
+
+    print(f"ni_table updated rows: {updated}")
+
+def update_ca_table(slide: Slide, shape: BaseShape, prs: Presentation, ctx: UpdateContext) -> None:
+    if not hasattr(shape, "table"):
+        return
+
+    import sqlite3
+    from pptx.dml.color import RGBColor
+
+    owner_sql, owner_params = _owner_filter_sql(ctx)
+
+    def _norm(s: str) -> str:
+        return (s or "").replace("\r", "").replace(" \n", "\n").strip()
+
+    def _norm_key(s: str) -> str:
+        return _norm(s).replace("\n", " ").strip().lower()
+
+    def _fmt_currency0(x: float) -> tuple[str, bool]:
+        if abs(x) < 0.5:
+            return "-", False
+        if x < 0:
+            return f"(${abs(x):,.0f})", True
+        return f"${x:,.0f}", False
+
+    def _apply_red_if_negative(cell, is_negative: bool) -> None:
+        if not is_negative:
+            return
+        try:
+            p0 = cell.text_frame.paragraphs[0]
+            if p0.runs:
+                p0.runs[0].font.color.rgb = RGBColor(255, 0, 0)
+        except Exception:
+            return
+
+    def _set_currency_cell0(cell, amount: float) -> None:
+        txt, is_neg = _fmt_currency0(amount)
+        _set_cell_text_preserve_cell_format(cell, txt)
+        _apply_red_if_negative(cell, is_neg)
+
+    tbl = shape.table
+    if len(tbl.columns) < 2:
+        print("ca_table must have at least 2 columns.")
+        return
+
+    sql = f"""
+        SELECT
+            COALESCE(SUM(CASE WHEN cash_categorization = '1180 Cash Account' THEN cash_value ELSE 0 END), 0.0) AS reserve_balance,
+            COALESCE(SUM(CASE WHEN cash_categorization = '1150 Cash Account' THEN cash_value ELSE 0 END), 0.0) AS investor_balance
+        FROM gl_agg
+        WHERE investor = ?
+          AND (timeframe IS NULL OR timeframe <> 'N/A')
+          {owner_sql}
+    """
+
+    con = sqlite3.connect(str(config.SQLITE_PATH))
+    try:
+        row = con.execute(sql, (ctx.investor, *owner_params)).fetchone()
+    finally:
+        con.close()
+
+    reserve_raw = float((row[0] if row and row[0] is not None else 0.0))
+    investor_raw = float((row[1] if row and row[1] is not None else 0.0))
+
+    reserve_balance = apply_ownership_amount(ctx, reserve_raw, "ca_table.reserve_account_balance")
+    investor_balance = apply_ownership_amount(ctx, investor_raw, "ca_table.investor_account_balance")
+    cash_available = apply_ownership_amount(ctx, reserve_raw + investor_raw, "ca_table.cash_available")
+
+    updated = 0
+
+    for r in range(len(tbl.rows)):
+        label_cell = tbl.cell(r, 0)
+        value_cell = tbl.cell(r, 1)
+
+        label_raw = _norm(label_cell.text)
+        key = _norm_key(label_raw)
+
+        if key in ("cash available", "cash available "):
+            _set_currency_cell0(value_cell, cash_available)
+            updated += 1
+            continue
+
+        if key in ("reserve account balance", "reserve account balance "):
+            _set_currency_cell0(value_cell, reserve_balance)
+            updated += 1
+            continue
+
+        if key in ("investor account balance", "investor account balance "):
+            _set_currency_cell0(value_cell, investor_balance)
+            updated += 1
+            continue
+
+    print(f"ca_table updated rows: {updated}")

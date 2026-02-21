@@ -182,16 +182,70 @@ def _get_portfolio_cumulative_income(ctx: UpdateContext) -> float:
     raw = float((row[0] if row and row[0] is not None else 0.0))
     return apply_ownership_amount(ctx, raw, "text.cumulative_income_timeframes")
 
-def update_summary_title(slide: Slide, shape: BaseShape, prs: Presentation, ctx: UpdateContext) -> None:
+def _pct_token(ctx: UpdateContext) -> str:
+    return f"{float(ctx.ownership_pct or 0.0):.2f}%"
+
+
+def update_overview_title(slide: Slide, shape: BaseShape, prs: Presentation, ctx: UpdateContext) -> None:
+    # Normal title: visible only when FULL ownership
+    is_partial = float(ctx.ownership_pct or 0.0) < 100.0
+    shape.visible = (not is_partial)
+
     owner_str = str(ctx.owner).strip() if ctx.owner else _get_investor_owners(ctx.investor)
     token_map = {
         "[Owner]": owner_str,
         "[T1]": ctx.t1_str,
     }
     count = _replace_tokens_in_shape_robust(shape, token_map)
-    print(f"summary_title replacements applied: {count}")
+    print(f"overview_title replacements applied: {count}")
+
+
+def update_overview_title_pct(slide: Slide, shape: BaseShape, prs: Presentation, ctx: UpdateContext) -> None:
+    # PCT title: visible only when PARTIAL ownership
+    is_partial = float(ctx.ownership_pct or 0.0) < 100.0
+    shape.visible = is_partial
+
+    owner_str = str(ctx.owner).strip() if ctx.owner else _get_investor_owners(ctx.investor)
+    token_map = {
+        "[Owner]": owner_str,
+        "[T1]": ctx.t1_str,
+        "[PCT]": _pct_token(ctx),
+    }
+    count = _replace_tokens_in_shape_robust(shape, token_map)
+    print(f"overview_title_pct replacements applied: {count}")
+
+
+def update_perf_summary_title(slide: Slide, shape: BaseShape, prs: Presentation, ctx: UpdateContext) -> None:
+    is_partial = float(ctx.ownership_pct or 0.0) < 100.0
+    shape.visible = (not is_partial)
+
+    owner_str = str(ctx.owner).strip() if ctx.owner else _get_investor_owners(ctx.investor)
+    token_map = {
+        "[Owner]": owner_str,
+        "[T1]": ctx.t1_str,
+    }
+    count = _replace_tokens_in_shape_robust(shape, token_map)
+    print(f"perf_summary_title replacements applied: {count}")
+
+
+def update_perf_summary_title_pct(slide: Slide, shape: BaseShape, prs: Presentation, ctx: UpdateContext) -> None:
+    is_partial = float(ctx.ownership_pct or 0.0) < 100.0
+    shape.visible = is_partial
+
+    owner_str = str(ctx.owner).strip() if ctx.owner else _get_investor_owners(ctx.investor)
+    token_map = {
+        "[Owner]": owner_str,
+        "[T1]": ctx.t1_str,
+        "[PCT]": _pct_token(ctx),
+    }
+    count = _replace_tokens_in_shape_robust(shape, token_map)
+    print(f"perf_summary_title_pct replacements applied: {count}")
+
 
 def update_cash_summary_title(slide: Slide, shape: BaseShape, prs: Presentation, ctx: UpdateContext) -> None:
+    is_partial = float(ctx.ownership_pct or 0.0) < 100.0
+    shape.visible = (not is_partial)
+
     owner_str = str(ctx.owner).strip() if ctx.owner else _get_investor_owners(ctx.investor)
     token_map = {
         "[Owner]": owner_str,
@@ -199,6 +253,20 @@ def update_cash_summary_title(slide: Slide, shape: BaseShape, prs: Presentation,
     }
     count = _replace_tokens_in_shape_robust(shape, token_map)
     print(f"cash_summary_title replacements applied: {count}")
+
+
+def update_cash_summary_title_pct(slide: Slide, shape: BaseShape, prs: Presentation, ctx: UpdateContext) -> None:
+    is_partial = float(ctx.ownership_pct or 0.0) < 100.0
+    shape.visible = is_partial
+
+    owner_str = str(ctx.owner).strip() if ctx.owner else _get_investor_owners(ctx.investor)
+    token_map = {
+        "[Owner]": owner_str,
+        "[T1]": ctx.t1_str,
+        "[PCT]": _pct_token(ctx),
+    }
+    count = _replace_tokens_in_shape_robust(shape, token_map)
+    print(f"cash_summary_title_pct replacements applied: {count}")
 
 def update_summary_top_text(slide: Slide, shape: BaseShape, prs: Presentation, ctx: UpdateContext) -> None:
     def _norm_header(s: str) -> str:

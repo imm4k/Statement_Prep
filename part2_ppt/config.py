@@ -37,9 +37,18 @@ OWNERSHIP_SCALING_EXCEPTIONS = [
 ]
 
 PARTIAL_OWNERSHIP_VISIBILITY_RULES = {
-    "pct_owner_note": {"full": True, "partial": True},
+    # Show normal titles for full ownership, hide pct titles
     "overview_title": {"full": True, "partial": False},
-    "pct_overview_title": {"full": False, "partial": True},
+    "perf_summary_title": {"full": True, "partial": False},
+    "cash_summary_title": {"full": True, "partial": False},
+
+    # Show pct titles for partial ownership, hide normal titles
+    "overview_title_pct": {"full": False, "partial": True},
+    "perf_summary_title_pct": {"full": False, "partial": True},
+    "cash_summary_title_pct": {"full": False, "partial": True},
+
+    # Owner note only when partial
+    "pct_owner_note": {"full": False, "partial": True},
 }
 
 EXPORT_MONTHLY_STMT_XLSX = False

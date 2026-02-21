@@ -11,16 +11,31 @@ from ppt_objects import UpdateContext
 _P_NS = {"p": "http://schemas.openxmlformats.org/presentationml/2006/main"}
 
 def _set_shape_hidden_via_selection_pane(shape: BaseShape, hide: bool) -> None:
+    """
+    Properly hide or unhide a shape so PowerPoint actually renders it invisible.
+    """
     try:
+        # 1) Set the cNvPr hidden attribute (legacy method)
         cNvPr = shape._element.xpath(".//p:cNvPr", namespaces=_P_NS)
-        if not cNvPr:
-            return
-        node = cNvPr[0]
-        if hide:
-            node.set("hidden", "1")
-        else:
-            if "hidden" in node.attrib:
+        if cNvPr:
+            node = cNvPr[0]
+            if hide:
+                node.set("hidden", "1")
+            elif "hidden" in node.attrib:
                 del node.attrib["hidden"]
+
+        # 2) Set shape properties noShowAsBullet/noClick so PPT UI respects it
+        spPr = shape._element.xpath(".//p:spPr", namespaces=_P_NS)
+        if spPr:
+            spPr = spPr[0]
+            if hide:
+                spPr.set("noShowAsBullet", "1")
+                spPr.set("noClick", "1")
+            else:
+                if "noShowAsBullet" in spPr.attrib:
+                    del spPr.attrib["noShowAsBullet"]
+                if "noClick" in spPr.attrib:
+                    del spPr.attrib["noClick"]
     except Exception:
         return
 
